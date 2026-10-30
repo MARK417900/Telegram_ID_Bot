@@ -19,13 +19,13 @@ const ADMIN_ID = 8521844327;
 // ─── REQUIRED CHANNEL (users must join before ANYTHING works) ────────────────
 // ⚠️ Set these two (env vars on your host, or edit the fallback values):
 //   CHANNEL_ID   → "@YourChannelUsername" (public) or "-100xxxxxxxxxx" (private)
-//   CHANNEL_LINK → invite link of the "ID Store" channel
+//   CHANNEL_LINK → invite link of the "Mark Zone" channel
 // The bot MUST be an admin in that channel, otherwise it cannot check membership.
-const CHANNEL_ID = process.env.CHANNEL_ID || "@IDStore";
-const CHANNEL_LINK = process.env.CHANNEL_LINK || "https://t.me/IDStore";
+const CHANNEL_ID = process.env.CHANNEL_ID || "@EarnWithMark41";
+const CHANNEL_LINK = process.env.CHANNEL_LINK || "https://t.me/EarnWithMark41";
 // Add more entries here later if you want to force-join more chats (e.g. your old group).
 const REQUIRED_CHATS = [
-  { id: CHANNEL_ID, link: CHANNEL_LINK, name: "ID Store" },
+  { id: CHANNEL_ID, link: CHANNEL_LINK, name: "Mark Zone" },
 ];
 
 // ─── REFERRAL CONFIG ──────────────────────────────────────────────────────────
