@@ -42,21 +42,74 @@ const ACCOUNT_TYPES = {
   whatsapp: { label: "📱 WhatsApp", price: 40 },
   telegram: { label: "✈️ Telegram", price: 40 },
 };
-// Countries available for stock. Add more lines here (key must be letters/numbers only).
-const COUNTRIES = {
-  india: { label: "🇮🇳 India" },
-  nepal: { label: "🇳🇵 Nepal" },
-  // bangladesh: { label: "🇧🇩 Bangladesh" },
-  // usa: { label: "🇺🇸 USA" },
-};
 const ACCOUNT_MAX_QTY = 10;
-const ADD_STOCK_MAX_QTY = 500;
+const ADD_STOCK_MAX_QTY = 500; // max per country in one add
 const PAYMENT_QR = "https://raw.githubusercontent.com/MARK417900/telegram-invite-bot/main/PaymentQR.jpg";
 const UPI_ID = "7891624054@mbk";
 
 // ─── DEPOSIT CONFIG ───────────────────────────────────────────────────────────
 const MIN_DEPOSIT = 10;
 const MAX_DEPOSIT = 10000;
+
+// ─── COUNTRIES (auto-created from what admin types in Add Stock) ──────────────
+// Known names get a flag + spelling fixes. Anything else still works, shown as "🌍 Name".
+const KNOWN_COUNTRIES = [
+  { key: "india", label: "🇮🇳 India", alts: ["india", "indian", "bharat"] },
+  { key: "nepal", label: "🇳🇵 Nepal", alts: ["nepal", "nepali", "nepalese"] },
+  { key: "indonesia", label: "🇮🇩 Indonesia", alts: ["indonesia", "indoneshia", "indonesian", "indo"] },
+  { key: "bangladesh", label: "🇧🇩 Bangladesh", alts: ["bangladesh", "bangladeshi", "bd"] },
+  { key: "pakistan", label: "🇵🇰 Pakistan", alts: ["pakistan", "pakistani", "pak"] },
+  { key: "srilanka", label: "🇱🇰 Sri Lanka", alts: ["srilanka", "srilankan"] },
+  { key: "usa", label: "🇺🇸 USA", alts: ["usa", "us", "america", "unitedstates"] },
+  { key: "uk", label: "🇬🇧 UK", alts: ["uk", "england", "unitedkingdom", "britain"] },
+  { key: "philippines", label: "🇵🇭 Philippines", alts: ["philippines", "philipines", "filipino", "ph"] },
+  { key: "vietnam", label: "🇻🇳 Vietnam", alts: ["vietnam", "vietnamese"] },
+  { key: "thailand", label: "🇹🇭 Thailand", alts: ["thailand", "thai"] },
+  { key: "malaysia", label: "🇲🇾 Malaysia", alts: ["malaysia", "malaysian"] },
+  { key: "russia", label: "🇷🇺 Russia", alts: ["russia", "russian"] },
+  { key: "brazil", label: "🇧🇷 Brazil", alts: ["brazil", "brazilian"] },
+  { key: "uae", label: "🇦🇪 UAE", alts: ["uae", "dubai", "emirates"] },
+  { key: "egypt", label: "🇪🇬 Egypt", alts: ["egypt", "egyptian"] },
+  { key: "nigeria", label: "🇳🇬 Nigeria", alts: ["nigeria", "nigerian"] },
+  { key: "kenya", label: "🇰🇪 Kenya", alts: ["kenya", "kenyan"] },
+  { key: "turkey", label: "🇹🇷 Turkey", alts: ["turkey", "turkish"] },
+  { key: "myanmar", label: "🇲🇲 Myanmar", alts: ["myanmar", "burma"] },
+];
+
+function titleCase(s) {
+  return s.split(/\s+/).filter(Boolean).map(w => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+}
+
+// "indoneshia" → { key: "indonesia", label: "🇮🇩 Indonesia" }; unknown → { key: "south-africa", label: "🌍 South Africa" }
+function resolveCountry(rawName) {
+  const name = rawName.trim();
+  const norm = name.toLowerCase().replace(/[^a-z]/g, "");
+  const known = KNOWN_COUNTRIES.find(c => c.alts.includes(norm));
+  if (known) return { key: known.key, label: known.label };
+  const key = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 20);
+  if (!key) return null;
+  return { key, label: "🌍 " + titleCase(name) };
+}
+
+// "2 indian 3 nepal 4 indoneshia" → [{key,label,count}, ...]  (null if it can't be read)
+function parseStockInput(text) {
+  const cleaned = text.replace(/[,;\n]+/g, " ").trim();
+  if (!/^\d/.test(cleaned)) return null;
+  const re = /(\d+)\s*([^\d]+)/g;
+  const merged = {};
+  let m;
+  while ((m = re.exec(cleaned))) {
+    const count = parseInt(m[1], 10);
+    const name = m[2].replace(/[^\p{L}\s.'-]/gu, " ").replace(/\s+/g, " ").trim();
+    if (!name || count < 1 || count > ADD_STOCK_MAX_QTY) return null;
+    const c = resolveCountry(name);
+    if (!c) return null;
+    if (merged[c.key]) merged[c.key].count += count;
+    else merged[c.key] = { key: c.key, label: c.label, count };
+  }
+  const list = Object.values(merged);
+  return list.length ? list : null;
+}
 
 // ─── Escape special Markdown characters in user-supplied text ─────────────────
 function escMD(text) {
@@ -68,14 +121,13 @@ function escMD(text) {
 let users = {};
 let pendingDeposits = {};
 let pendingAccountOrders = {};
-// stock[type][country] = [ "email:pass", ... ]
+// stock[type][countryKey] = number of accounts available
 let stock = {};
-for (const t of Object.keys(ACCOUNT_TYPES)) {
-  stock[t] = {};
-  for (const c of Object.keys(COUNTRIES)) stock[t][c] = [];
-}
+for (const t of Object.keys(ACCOUNT_TYPES)) stock[t] = {};
+let countryLabels = {};       // { countryKey: "🇮🇳 India" }
 let adminReplyMap = {};       // { adminMessageId: userChatId } — swipe-reply support messages
 let orderMsgMap = {};         // { adminMessageId: orderId }    — swipe-reply order chat messages
+let adminCurrentOrder = null; // order that admin's plain messages / keyboard buttons act on
 let botOnline = true;
 let adminState = {};
 let userState = {};
@@ -88,17 +140,19 @@ function genTxnId() {
   return "TXN" + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 1000);
 }
 
-const stockCount = (type, country) => (stock[type] && stock[type][country] ? stock[type][country].length : 0);
-const typeTotal = (type) => Object.values(stock[type] || {}).reduce((s, arr) => s + arr.length, 0);
+const countryLabel = (key) => countryLabels[key] || key;
+const stockCount = (type, country) => (stock[type] && stock[type][country]) || 0;
+const typeTotal = (type) => Object.values(stock[type] || {}).reduce((s, n) => s + n, 0);
 const totalStock = () => Object.keys(ACCOUNT_TYPES).reduce((s, t) => s + typeTotal(t), 0);
+const countriesInStock = (type) => Object.entries(stock[type] || {}).filter(([, n]) => n > 0);
 
 function stockSummaryText() {
   let out = "";
   for (const [tk, t] of Object.entries(ACCOUNT_TYPES)) {
     out += `${t.label} — ₹${t.price} each (total ${typeTotal(tk)})\n`;
-    for (const [ck, c] of Object.entries(COUNTRIES)) {
-      out += `   ${c.label}: ${stockCount(tk, ck)}\n`;
-    }
+    const list = countriesInStock(tk);
+    if (!list.length) out += `   — out of stock —\n`;
+    for (const [ck, n] of list) out += `   ${countryLabel(ck)}: ${n}\n`;
     out += "\n";
   }
   return out.trimEnd();
@@ -166,11 +220,29 @@ function adminMenu() {
   };
 }
 
+// Keyboard shown to admin while an order conversation is running
+function chatKeyboard() {
+  return {
+    reply_markup: {
+      keyboard: [
+        [{ text: "✅ Order Done" }, { text: "❌ Cancel Order" }],
+        [{ text: "💬 Active Orders" }, { text: "🔙 Admin Menu" }],
+      ],
+      resize_keyboard: true,
+      persistent: true,
+    },
+  };
+}
+
+// chat keyboard while any order chat is open, normal admin menu otherwise
+const adminKb = () => (activeOrders().length ? chatKeyboard() : adminMenu());
+
 // Texts that are menu buttons — these must never be relayed into an order chat.
 const MENU_TEXTS = new Set([
   "👤 Profile", "💰 Deposit", "Stock", "🛒 Buy Account", "🤝 Refer & Earn", "🆘 Support",
   "📢 Broadcast", "📊 Bot Status", "👤 MSG User", "🔴 Bot OFF", "🟢 Bot ON", "👥 All Users",
   "📦 Add Stock", "💬 Active Orders", "🔙 User Menu",
+  "✅ Order Done", "❌ Cancel Order", "🔙 Admin Menu",
   "❌ Cancel", "❌ Cancel Deposit", "❌ Cancel Purchase",
 ]);
 
@@ -202,14 +274,13 @@ function accountTypeText() {
   );
 }
 
-// Generic country picker. prefix + countryKey = callback_data
-function countryKeyboard(prefix, accType, cancelData, { requireStock = false } = {}) {
+// Country buttons are built automatically from what is currently in stock for this type.
+// prefix + countryKey = callback_data
+function countryKeyboard(prefix, accType, cancelData) {
   const rows = [];
   let row = [];
-  for (const [key, c] of Object.entries(COUNTRIES)) {
-    const n = stockCount(accType, key);
-    if (requireStock && n === 0) continue;
-    row.push({ text: `${c.label} (${n})`, callback_data: `${prefix}${key}` });
+  for (const [key, n] of countriesInStock(accType)) {
+    row.push({ text: `${countryLabel(key)} (${n})`, callback_data: `${prefix}${key}` });
     if (row.length === 2) { rows.push(row); row = []; }
   }
   if (row.length) rows.push(row);
@@ -237,9 +308,8 @@ function buyAccountQtyKeyboard(qty) {
 
 function buyAccountQtyText(accType, country, qty) {
   const t = ACCOUNT_TYPES[accType];
-  const c = COUNTRIES[country];
   return (
-    `🛒 Buy ${t.label} Account (${c.label})\n\n` +
+    `🛒 Buy ${t.label} Account (${countryLabel(country)})\n\n` +
     `How many accounts would you like to buy?\n` +
     `In stock: ${stockCount(accType, country)}\n\n` +
     `Price: ₹${t.price} per account\n` +
@@ -309,19 +379,8 @@ async function passesGate(chatId) {
 }
 
 // ─── ORDER CHAT (user ↔ admin after approval) ─────────────────────────────────
-function orderChatKeyboard(orderId) {
-  return {
-    reply_markup: {
-      inline_keyboard: [[
-        { text: "✅ Order Done", callback_data: `order_done_${orderId}` },
-        { text: "❌ Cancel Order", callback_data: `order_cancel_${orderId}` },
-      ]],
-    },
-  };
-}
-
 const typeLabelOf = (o) => ACCOUNT_TYPES[o.accType]?.label || o.accType;
-const countryLabelOf = (o) => COUNTRIES[o.country]?.label || o.country;
+const countryLabelOf = (o) => countryLabel(o.country);
 const priceTextOf = (o) => (o.isFree ? "FREE 🎁" : `₹${o.price}`);
 
 function activeOrderOfUser(chatId) {
@@ -333,10 +392,12 @@ function activeOrders() {
   return Object.values(pendingAccountOrders).filter(o => o.chatActive);
 }
 
-// Which order does an admin message belong to? Swipe-reply wins, else the only active order.
+// Which order does an admin message/button belong to?
+// 1) swipe-reply target  2) the order whose user wrote last  3) the only active order
 function resolveAdminOrder(msg) {
   const rid = msg.reply_to_message && orderMsgMap[msg.reply_to_message.message_id];
   if (rid && pendingAccountOrders[rid]?.chatActive) return pendingAccountOrders[rid];
+  if (adminCurrentOrder && pendingAccountOrders[adminCurrentOrder]?.chatActive) return pendingAccountOrders[adminCurrentOrder];
   const active = activeOrders();
   return active.length === 1 ? active[0] : null;
 }
@@ -350,50 +411,84 @@ function orderHeader(order) {
 }
 
 function relayUserToAdmin(order, msg) {
-  const kb = orderChatKeyboard(order.orderId);
+  adminCurrentOrder = order.orderId;
   const remember = (s) => { if (s) orderMsgMap[s.message_id] = order.orderId; };
   if (msg.photo) {
     const fileId = msg.photo[msg.photo.length - 1].file_id;
-    bot.sendPhoto(ADMIN_ID, fileId, { caption: orderHeader(order) + (msg.caption || ""), ...kb })
+    bot.sendPhoto(ADMIN_ID, fileId, { caption: orderHeader(order) + (msg.caption || ""), ...chatKeyboard() })
       .then(remember).catch(() => { });
   } else if (msg.text) {
-    send(ADMIN_ID, orderHeader(order) + msg.text, kb).then(remember);
+    send(ADMIN_ID, orderHeader(order) + msg.text, chatKeyboard()).then(remember);
   }
 }
 
-function startOrderChat(order, delivered) {
+function startOrderChat(order, stockDeducted) {
   order.status = "approved";
   order.chatActive = true;
-  order.deliveredItems = delivered;
+  order.stockDeducted = stockDeducted;
+  adminCurrentOrder = order.orderId;
 
   const typeLabel = typeLabelOf(order);
-  let userText =
+  send(order.chatId,
     `✅ Your order has been approved!\n\n` +
     `Order ID: ${order.orderId}\n` +
     `Type: ${typeLabel}\n` +
     `Country: ${countryLabelOf(order)}\n` +
     `Accounts: ${order.quantity}\n` +
-    `Amount: ${priceTextOf(order)}\n\n`;
-  if (delivered.length) {
-    userText += `Your account details:\n` + delivered.map(d => tapCopy(d)).join("\n") + `\n\n`;
-  } else {
-    userText += `Admin will send your account details here shortly.\n\n`;
-  }
-  userText += `💬 You are now connected with admin for this order. Just type here and your messages go to admin directly.`;
-  sendMD(order.chatId, userText, mainMenu());
+    `Amount: ${priceTextOf(order)}\n\n` +
+    `💬 You are now connected with admin for this order. Admin will send your account details here — you can also type here and your messages go to admin directly.`,
+    mainMenu());
 
   let adminText =
     `✅ Order ${order.orderId} approved — chat started\n` +
     `User: ${users[order.chatId]?.name || order.chatId} (${order.chatId})\n` +
-    `${typeLabel} • ${countryLabelOf(order)} • x${order.quantity} • ${priceTextOf(order)}\n`;
-  if (delivered.length) {
-    adminText += `\n📦 ${delivered.length} account(s) auto-sent from stock.\n`;
-  } else {
-    adminText += `\n⚠️ Not enough ${countryLabelOf(order)} ${typeLabel} stock — send the account details to the user in this chat.\n`;
+    `${typeLabel} • ${countryLabelOf(order)} • x${order.quantity} • ${priceTextOf(order)}\n\n`;
+  if (!stockDeducted) {
+    adminText += `⚠️ Stock count was lower than the order — nothing was deducted.\n\n`;
   }
-  adminText += `\n↩️ Swipe-reply to any message of this order to talk to the user.\nWhen finished tap ✅ Order Done (or ❌ Cancel Order).`;
-  send(ADMIN_ID, adminText, orderChatKeyboard(order.orderId))
+  adminText +=
+    `Type here to message the user. Use the keyboard below: ✅ Order Done / ❌ Cancel Order.\n` +
+    `(With several chats open, swipe-reply to a message of the order you mean.)`;
+  send(ADMIN_ID, adminText, chatKeyboard())
     .then(s => { if (s) orderMsgMap[s.message_id] = order.orderId; });
+}
+
+// Close an order chat from the admin keyboard (Done / Cancel)
+function closeOrder(orderId, isDone) {
+  const order = pendingAccountOrders[orderId];
+  if (!order || !order.chatActive) {
+    send(ADMIN_ID, "❌ This order chat is already closed or not found.", adminKb());
+    return;
+  }
+  order.chatActive = false;
+  if (adminCurrentOrder === orderId) adminCurrentOrder = null;
+
+  if (isDone) {
+    order.status = "completed";
+    send(ADMIN_ID, `✅ Order ${orderId} marked as DONE. Chat closed.`, adminKb());
+    send(order.chatId,
+      `✅ Your order is complete!\n\n` +
+      `Order ID: ${orderId}\n` +
+      `Thank you for buying from us. 💚`,
+      mainMenu());
+    processReferral(order);
+  } else {
+    order.status = "cancelled";
+    let extra = "";
+    if (order.isFree && users[order.chatId]) {
+      users[order.chatId].freeClaimed = Math.max(0, (users[order.chatId].freeClaimed || 0) - 1);
+      extra = `\n\nYour free-account credit has been restored.`;
+    } else if (REFUND_ON_CANCEL && users[order.chatId] && order.price > 0) {
+      users[order.chatId].balance = (users[order.chatId].balance || 0) + order.price;
+      extra = `\n\n₹${order.price} has been added to your bot balance.`;
+    }
+    send(ADMIN_ID, `❌ Order ${orderId} CANCELLED. Chat closed.`, adminKb());
+    send(order.chatId,
+      `❌ Your order has been cancelled by admin.\n\n` +
+      `Order ID: ${orderId}${extra}\n\n` +
+      `If you have questions, use 🆘 Support.`,
+      mainMenu());
+  }
 }
 
 // Credit referrer when the referred user's first (paid) order is completed.
@@ -428,7 +523,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   registerUser(msg, referredBy);
 
   if (isAdmin(chatId)) {
-    send(chatId, "👑 Welcome Admin!", adminMenu());
+    send(chatId, "👑 Welcome Admin!", adminKb());
     return;
   }
   if (!botOnline) { send(chatId, "🔴 Bot is offline for maintenance. Try again later."); return; }
@@ -457,18 +552,19 @@ bot.on("message", async msg => {
   if (isAdmin(chatId)) {
 
     // ── SWIPE-REPLY: ORDER CHAT (admin → user) ──────────────────────────────
-    if (msg.reply_to_message && orderMsgMap[msg.reply_to_message.message_id] && text) {
+    if (msg.reply_to_message && orderMsgMap[msg.reply_to_message.message_id] && text && !MENU_TEXTS.has(text)) {
       const order = pendingAccountOrders[orderMsgMap[msg.reply_to_message.message_id]];
       if (order && order.chatActive) {
+        adminCurrentOrder = order.orderId;
         send(order.chatId, `👨‍💼 Admin:\n\n${text}`);
         return;
       }
-      send(chatId, "❌ That order chat is already closed.");
+      send(chatId, "❌ That order chat is already closed.", adminKb());
       return;
     }
 
     // ── SWIPE-REPLY RELAY (support messages) ────────────────────────────────
-    if (msg.reply_to_message && adminReplyMap[msg.reply_to_message.message_id] && text) {
+    if (msg.reply_to_message && adminReplyMap[msg.reply_to_message.message_id] && text && !MENU_TEXTS.has(text)) {
       const targetUserId = adminReplyMap[msg.reply_to_message.message_id];
       if (users[targetUserId]) {
         send(targetUserId, `💬 Message from Admin:\n\n${text}`, mainMenu());
@@ -496,13 +592,13 @@ bot.on("message", async msg => {
             }
           });
           delete adminState[chatId];
-          send(chatId, `✅ Photo broadcast sent to ${n} users.`, adminMenu());
+          send(chatId, `✅ Photo broadcast sent to ${n} users.`, adminKb());
           return;
         }
         if (st.action === "msg_user_photo") {
           bot.sendPhoto(st.targetId, fileId, { caption: caption ? `${caption}` : "...." })
-            .then(() => send(chatId, "✅ Photo sent.", adminMenu()))
-            .catch(() => send(chatId, "❌ Failed to send photo.", adminMenu()));
+            .then(() => send(chatId, "✅ Photo sent.", adminKb()))
+            .catch(() => send(chatId, "❌ Failed to send photo.", adminKb()));
           delete adminState[chatId];
           return;
         }
@@ -510,7 +606,7 @@ bot.on("message", async msg => {
 
       if (text === "❌ Cancel") {
         delete adminState[chatId];
-        send(chatId, "❌ Cancelled.", adminMenu());
+        send(chatId, "❌ Cancelled.", adminKb());
         return;
       }
 
@@ -520,7 +616,7 @@ bot.on("message", async msg => {
           if (+uid !== ADMIN_ID) { bot.sendMessage(uid, `${text}`).catch(() => { }); n++; }
         });
         delete adminState[chatId];
-        send(chatId, `✅ Broadcast sent to ${n} users.`, adminMenu());
+        send(chatId, `✅ Broadcast sent to ${n} users.`, adminKb());
         return;
       }
 
@@ -534,53 +630,30 @@ bot.on("message", async msg => {
 
       if (st.action === "msg_user_text") {
         bot.sendMessage(st.targetId, `${text}`)
-          .then(() => send(chatId, "✅ Message sent.", adminMenu()))
-          .catch(() => send(chatId, "❌ Failed to send.", adminMenu()));
+          .then(() => send(chatId, "✅ Message sent.", adminKb()))
+          .catch(() => send(chatId, "❌ Failed to send.", adminKb()));
         delete adminState[chatId];
         return;
       }
 
-      // ── ADD STOCK — STEP 3: QUANTITY ────────────────────────────────────
-      if (st.action === "add_stock_qty") {
-        if (!text || !/^\d+$/.test(text.trim())) {
-          send(chatId, "❌ Please send a valid number (e.g. 5), or tap Cancel.", cancelKb());
-          return;
-        }
-        const qty = parseInt(text.trim(), 10);
-        if (qty < 1 || qty > ADD_STOCK_MAX_QTY) {
-          send(chatId, `❌ Quantity must be between 1 and ${ADD_STOCK_MAX_QTY}.`, cancelKb());
-          return;
-        }
-        adminState[chatId] = { action: "add_stock_items", type: st.type, country: st.country, qty };
-        send(chatId,
-          `📦 Adding ${qty} ${ACCOUNT_TYPES[st.type].label} (${COUNTRIES[st.country].label}) account${qty > 1 ? "s" : ""}\n\n` +
-          `Now send exactly ${qty} account detail${qty > 1 ? "s" : ""}, one per line. Example:\n` +
-          `user1@mail.com:pass123\n` +
-          `user2@mail.com:pass456`,
-          cancelKb());
-        return;
-      }
-
-      // ── ADD STOCK — STEP 4: ACCOUNT DETAILS → PREVIEW + CONFIRM ─────────
-      if (st.action === "add_stock_items") {
-        if (!text) { send(chatId, "❌ Please send the account details as text.", cancelKb()); return; }
-        const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-        if (lines.length !== st.qty) {
+      // ── ADD STOCK — STEP 2: "2 india 3 nepal 4 indonesia" → PREVIEW + CONFIRM ──
+      if (st.action === "add_stock_input") {
+        if (!text) { send(chatId, "❌ Please send the stock as text.", cancelKb()); return; }
+        const entries = parseStockInput(text);
+        if (!entries) {
           send(chatId,
-            `❌ You said ${st.qty} but sent ${lines.length} line${lines.length === 1 ? "" : "s"}.\n` +
-            `Send exactly ${st.qty} line${st.qty > 1 ? "s" : ""} (one account per line), or tap Cancel.`,
+            `❌ I couldn't read that.\n\nSend number + country pairs, like:\n2 india 3 nepal 4 indonesia\n\n` +
+            `(each number 1 – ${ADD_STOCK_MAX_QTY}) — or tap Cancel.`,
             cancelKb());
           return;
         }
-        adminState[chatId] = { action: "add_stock_confirm", type: st.type, country: st.country, items: lines };
-        const preview = lines.slice(0, 10).join("\n") + (lines.length > 10 ? `\n… and ${lines.length - 10} more` : "");
+        adminState[chatId] = { action: "add_stock_confirm", type: st.type, entries };
+        const total = entries.reduce((s, e) => s + e.count, 0);
         send(chatId,
           `📦 Confirm Stock\n\n` +
-          `Type: ${ACCOUNT_TYPES[st.type].label}\n` +
-          `Country: ${COUNTRIES[st.country].label}\n` +
-          `Quantity: ${lines.length}\n\n` +
-          `${preview}\n\n` +
-          `Add these to stock?`,
+          `Type: ${ACCOUNT_TYPES[st.type].label}\n\n` +
+          entries.map(e => `${e.label}: +${e.count}  (now ${stockCount(st.type, e.key) + e.count})`).join("\n") +
+          `\n\nTotal adding: ${total}\n\nAdd this to stock?`,
           {
             reply_markup: {
               inline_keyboard: [[
@@ -620,17 +693,37 @@ bot.on("message", async msg => {
         });
       return;
     }
+
+    // ── ORDER CHAT KEYBOARD BUTTONS ─────────────────────────────────────────
+    if (text === "✅ Order Done" || text === "❌ Cancel Order") {
+      const order = resolveAdminOrder(msg);
+      if (!order) {
+        send(chatId,
+          activeOrders().length
+            ? `⚠️ ${activeOrders().length} order chats are open. Swipe-reply to a message of the order, then press the button again (or tap 💬 Active Orders).`
+            : `No active order chat right now.`,
+          adminKb());
+        return;
+      }
+      closeOrder(order.orderId, text === "✅ Order Done");
+      return;
+    }
     if (text === "💬 Active Orders") {
       const list = activeOrders();
       if (!list.length) { send(chatId, "No active order chats right now.", adminMenu()); return; }
       list.forEach(o => {
         send(chatId,
-          `💬 Order ${o.orderId}\n` +
+          `💬 Order ${o.orderId}${adminCurrentOrder === o.orderId ? "  ⬅️ current" : ""}\n` +
           `User: ${users[o.chatId]?.name || o.chatId} (${o.chatId})\n` +
-          `${typeLabelOf(o)} • ${countryLabelOf(o)} • x${o.quantity} • ${priceTextOf(o)}`,
-          orderChatKeyboard(o.orderId)
+          `${typeLabelOf(o)} • ${countryLabelOf(o)} • x${o.quantity} • ${priceTextOf(o)}\n\n` +
+          `↩️ Swipe-reply to this message to talk to / close this order.`,
+          chatKeyboard()
         ).then(s => { if (s) orderMsgMap[s.message_id] = o.orderId; });
       });
+      return;
+    }
+    if (text === "🔙 Admin Menu") {
+      send(chatId, "👑 Admin menu.", adminMenu());
       return;
     }
     if (text === "📊 Bot Status") {
@@ -689,17 +782,19 @@ bot.on("message", async msg => {
       return;
     }
 
-    // ── PLAIN ADMIN TEXT → ORDER CHAT (only when no swipe-reply is needed) ──
+    // ── PLAIN ADMIN TEXT → ORDER CHAT ───────────────────────────────────────
     if (text && !MENU_TEXTS.has(text) && !st) {
-      const active = activeOrders();
-      if (active.length === 1) {
-        send(active[0].chatId, `👨‍💼 Admin:\n\n${text}`);
+      const order = resolveAdminOrder(msg);
+      if (order) {
+        adminCurrentOrder = order.orderId;
+        send(order.chatId, `👨‍💼 Admin:\n\n${text}`);
         return;
       }
-      if (active.length > 1) {
+      if (activeOrders().length > 1) {
         send(chatId,
-          `⚠️ ${active.length} order chats are active. Swipe-reply to a specific order message so I know who to send it to.\n` +
-          `Tap 💬 Active Orders to see them all.`);
+          `⚠️ ${activeOrders().length} order chats are open. Swipe-reply to a message of the order you want to answer.\n` +
+          `Tap 💬 Active Orders to see them all.`,
+          chatKeyboard());
         return;
       }
     }
@@ -941,56 +1036,43 @@ bot.on("callback_query", async query => {
   }
 
   // ══════════════════ ADMIN: ADD STOCK FLOW ══════════════════════════════════
-  // Step 1 → pick type → Step 2 → pick country
+  // Step 1 → pick type → Step 2 → type "2 india 3 nepal 4 indonesia"
   if (data.startsWith("addstock_type_")) {
     if (!isAdmin(chatId)) return;
     const type = data.replace("addstock_type_", "");
     if (!ACCOUNT_TYPES[type]) return;
-    adminState[chatId] = { action: "add_stock_country", type };
-    bot.editMessageText(
-      `📦 Add ${ACCOUNT_TYPES[type].label} Stock\n\nWhich country are these accounts from?`,
-      {
-        chat_id: chatId,
-        message_id: msgId,
-        reply_markup: countryKeyboard("addstock_country_", type, "addstock_cancel"),
-      }
-    ).catch(() => { });
-    return;
-  }
-
-  // Step 2 → country chosen → ask quantity
-  if (data.startsWith("addstock_country_")) {
-    if (!isAdmin(chatId)) return;
-    const st = adminState[chatId];
-    if (!st || st.action !== "add_stock_country") return;
-    const country = data.replace("addstock_country_", "");
-    if (!COUNTRIES[country]) return;
-    adminState[chatId] = { action: "add_stock_qty", type: st.type, country };
+    adminState[chatId] = { action: "add_stock_input", type };
     bot.deleteMessage(chatId, msgId).catch(() => { });
     send(chatId,
-      `📦 Add ${ACCOUNT_TYPES[st.type].label} • ${COUNTRIES[country].label} Stock\n\n` +
-      `How many accounts do you want to add? Send a number (1 – ${ADD_STOCK_MAX_QTY}).\n\n` +
-      `Current stock: ${stockCount(st.type, country)}`,
+      `📦 Add ${ACCOUNT_TYPES[type].label} Stock\n\n` +
+      `Send how many accounts per country, number first. Example:\n\n` +
+      `2 india 3 nepal 4 indonesia\n\n` +
+      `Buyers will automatically get a button for each country that is in stock.\n\n` +
+      `Current stock:\n` +
+      (countriesInStock(type).map(([k, n]) => `${countryLabel(k)}: ${n}`).join("\n") || "— none —"),
       cancelKb());
     return;
   }
 
-  // Step 5 → confirm and add
+  // Step 3 → confirm and add
   if (data === "addstock_confirm") {
     if (!isAdmin(chatId)) return;
     const st = adminState[chatId];
     if (!st || st.action !== "add_stock_confirm") return;
-    stock[st.type][st.country].push(...st.items);
-    const added = st.items.length;
-    const label = `${ACCOUNT_TYPES[st.type].label} ${COUNTRIES[st.country].label}`;
-    const nowCount = stockCount(st.type, st.country);
+    for (const e of st.entries) {
+      countryLabels[e.key] = e.label;
+      stock[st.type][e.key] = stockCount(st.type, e.key) + e.count;
+    }
+    const added = st.entries.reduce((s, e) => s + e.count, 0);
+    const label = ACCOUNT_TYPES[st.type].label;
+    const type = st.type;
     delete adminState[chatId];
     bot.deleteMessage(chatId, msgId).catch(() => { });
     send(chatId,
-      `✅ Added ${added} ${label} account${added > 1 ? "s" : ""} to stock.\n` +
-      `📦 ${label} stock now: ${nowCount}\n` +
-      `📦 Total stock: ${totalStock()}`,
-      adminMenu());
+      `✅ Added ${added} ${label} account${added > 1 ? "s" : ""} to stock.\n\n` +
+      countriesInStock(type).map(([k, n]) => `${countryLabel(k)}: ${n}`).join("\n") +
+      `\n\n📦 ${label} total: ${typeTotal(type)}\n📦 All stock: ${totalStock()}`,
+      adminKb());
     return;
   }
 
@@ -998,7 +1080,7 @@ bot.on("callback_query", async query => {
     if (!isAdmin(chatId)) return;
     delete adminState[chatId];
     bot.deleteMessage(chatId, msgId).catch(() => { });
-    send(chatId, "❌ Add stock cancelled.", adminMenu());
+    send(chatId, "❌ Add stock cancelled.", adminKb());
     return;
   }
 
@@ -1060,7 +1142,7 @@ bot.on("callback_query", async query => {
   }
 
   // ══════════════════ BUY ACCOUNT FLOW ═══════════════════════════════════════
-  // ── TYPE SELECTED → COUNTRY ─────────────────────────────────────────────────
+  // ── TYPE SELECTED → COUNTRY (buttons auto-built from stock) ─────────────────
   if (data.startsWith("buyacc_type_")) {
     const accType = data.replace("buyacc_type_", "");
     if (!ACCOUNT_TYPES[accType]) return;
@@ -1085,9 +1167,8 @@ bot.on("callback_query", async query => {
     const st = userState[chatId];
     if (!st || st.action !== "buy_account_country") return;
     const country = data.replace("buyacc_country_", "");
-    if (!COUNTRIES[country]) return;
     if (stockCount(st.accType, country) < 1) {
-      send(chatId, `❌ ${ACCOUNT_TYPES[st.accType].label} (${COUNTRIES[country].label}) is out of stock. Choose another country.`);
+      send(chatId, `❌ That country is out of stock now. Please choose another.`);
       return;
     }
     userState[chatId] = { action: "buy_account_qty", accType: st.accType, country, quantity: 1 };
@@ -1103,7 +1184,7 @@ bot.on("callback_query", async query => {
   if (data === "buyacc_minus" || data === "buyacc_plus") {
     const st = userState[chatId];
     if (!st || st.action !== "buy_account_qty") return;
-    const maxQty = Math.min(ACCOUNT_MAX_QTY, stockCount(st.accType, st.country));
+    const maxQty = Math.max(1, Math.min(ACCOUNT_MAX_QTY, stockCount(st.accType, st.country)));
     let qty = st.quantity;
     qty = data === "buyacc_plus" ? Math.min(maxQty, qty + 1) : Math.max(1, qty - 1);
     if (qty === st.quantity) return;
@@ -1141,7 +1222,7 @@ bot.on("callback_query", async query => {
     userState[chatId] = { action: "buy_account_qr", accType, country, quantity: qty, price };
     bot.sendPhoto(chatId, PAYMENT_QR, {
       caption:
-        `🛒 Buy ${qty} ${t.label} (${COUNTRIES[country].label}) Account${qty > 1 ? "s" : ""}\n\n` +
+        `🛒 Buy ${qty} ${t.label} (${countryLabel(country)}) Account${qty > 1 ? "s" : ""}\n\n` +
         `Amount to Pay: ₹${price}\n\n` +
         `UPI ID: ${tapCopy(UPI_ID)}\n\n` +
         `📷 After payment, tap "I Have Paid" and upload the screenshot.`,
@@ -1206,51 +1287,13 @@ bot.on("callback_query", async query => {
       return;
     }
 
-    // Approve → auto-deliver from matching country stock if possible, then START ORDER CHAT
-    const pool = (stock[order.accType] && stock[order.accType][order.country]) || [];
-    const delivered = pool.length >= order.quantity ? pool.splice(0, order.quantity) : [];
-    startOrderChat(order, delivered);
-    return;
-  }
-
-  // ── ORDER CHAT: ✅ DONE / ❌ CANCEL (admin only) ────────────────────────────
-  if (data.startsWith("order_done_") || data.startsWith("order_cancel_")) {
-    if (!isAdmin(chatId)) return;
-    const isDone = data.startsWith("order_done_");
-    const orderId = data.replace(isDone ? "order_done_" : "order_cancel_", "");
-    const order = pendingAccountOrders[orderId];
-    if (!order || !order.chatActive) {
-      send(chatId, "❌ This order chat is already closed or not found.");
-      return;
+    // Approve → deduct the stock count, then START ORDER CHAT (admin sends the details in chat)
+    let deducted = false;
+    if (stockCount(order.accType, order.country) >= order.quantity) {
+      stock[order.accType][order.country] -= order.quantity;
+      deducted = true;
     }
-    order.chatActive = false;
-
-    if (isDone) {
-      order.status = "completed";
-      send(chatId, `✅ Order ${orderId} marked as DONE. Chat closed.`);
-      send(order.chatId,
-        `✅ Your order is complete!\n\n` +
-        `Order ID: ${orderId}\n` +
-        `Thank you for buying from us. 💚`,
-        mainMenu());
-      processReferral(order);
-    } else {
-      order.status = "cancelled";
-      let extra = "";
-      if (order.isFree && users[order.chatId]) {
-        users[order.chatId].freeClaimed = Math.max(0, (users[order.chatId].freeClaimed || 0) - 1);
-        extra = `\n\nYour free-account credit has been restored.`;
-      } else if (REFUND_ON_CANCEL && users[order.chatId] && order.price > 0) {
-        users[order.chatId].balance = (users[order.chatId].balance || 0) + order.price;
-        extra = `\n\n₹${order.price} has been added to your bot balance.`;
-      }
-      send(chatId, `❌ Order ${orderId} CANCELLED. Chat closed.`);
-      send(order.chatId,
-        `❌ Your order has been cancelled by admin.\n\n` +
-        `Order ID: ${orderId}${extra}\n\n` +
-        `If you have questions, use 🆘 Support.`,
-        mainMenu());
-    }
+    startOrderChat(order, deducted);
     return;
   }
 
@@ -1290,7 +1333,7 @@ bot.on("callback_query", async query => {
       {
         chat_id: chatId,
         message_id: msgId,
-        reply_markup: countryKeyboard(`refclaim_country_${accType}_`, accType, "refclaim_cancel", { requireStock: true }),
+        reply_markup: countryKeyboard(`refclaim_country_${accType}_`, accType, "refclaim_cancel"),
       }
     ).catch(() => { });
     return;
@@ -1299,7 +1342,7 @@ bot.on("callback_query", async query => {
   if (data.startsWith("refclaim_country_")) {
     const [, , accType, country] = data.split("_");
     const u = users[chatId];
-    if (!ACCOUNT_TYPES[accType] || !COUNTRIES[country]) return;
+    if (!ACCOUNT_TYPES[accType] || !country) return;
     if (!u || availableFree(u) < 1) {
       send(chatId, `❌ You have no free account available.`);
       return;
@@ -1312,14 +1355,14 @@ bot.on("callback_query", async query => {
     const orderId = genOrderId();
     pendingAccountOrders[orderId] = {
       orderId, chatId, accType, country, quantity: 1, price: 0, isFree: true,
-      status: "pending", timestamp: new Date(),
+      status: "pending", chatActive: false, timestamp: new Date(),
     };
     bot.deleteMessage(chatId, msgId).catch(() => { });
     send(chatId,
       `🎁 Free account request sent!\n\n` +
       `Order ID: ${orderId}\n` +
       `Type: ${ACCOUNT_TYPES[accType].label}\n` +
-      `Country: ${COUNTRIES[country].label}\n\n` +
+      `Country: ${countryLabel(country)}\n\n` +
       `Admin will approve it shortly and chat with you here.`,
       mainMenu());
     send(ADMIN_ID,
@@ -1328,7 +1371,7 @@ bot.on("callback_query", async query => {
       `User: ${u.name || "Unknown"} (${chatId})\n` +
       `Username: @${u.username || "N/A"}\n` +
       `Type: ${ACCOUNT_TYPES[accType].label}\n` +
-      `Country: ${COUNTRIES[country].label}\n` +
+      `Country: ${countryLabel(country)}\n` +
       `Valid referrals: ${u.referCount}\n` +
       `Time: ${new Date().toLocaleString("en-IN")}`,
       {
@@ -1352,11 +1395,12 @@ bot.on("photo", async msg => {
   if (isAdmin(chatId)) {
     const fileId = msg.photo[msg.photo.length - 1].file_id;
 
-    // ── SWIPE-REPLY / SINGLE ACTIVE ORDER: photo to user in order chat ────
+    // ── SWIPE-REPLY / CURRENT ORDER: photo to user in order chat ──────────
     const isReplyToSupport = msg.reply_to_message && adminReplyMap[msg.reply_to_message.message_id];
     if (!isReplyToSupport && !adminState[chatId]) {
       const order = resolveAdminOrder(msg);
       if (order) {
+        adminCurrentOrder = order.orderId;
         bot.sendPhoto(order.chatId, fileId, {
           caption: msg.caption ? `👨‍💼 Admin:\n\n${msg.caption}` : "👨‍💼 Admin",
         }).then(() => send(chatId, `✅ Photo sent to order ${order.orderId}.`))
@@ -1435,7 +1479,7 @@ bot.on("photo", async msg => {
     const fileId = msg.photo[msg.photo.length - 1].file_id;
     const orderId = genOrderId();
     const typeLabel = ACCOUNT_TYPES[st.accType]?.label || st.accType;
-    const countryLabel = COUNTRIES[st.country]?.label || st.country;
+    const cLabel = countryLabel(st.country);
     pendingAccountOrders[orderId] = {
       orderId,
       chatId,
@@ -1455,7 +1499,7 @@ bot.on("photo", async msg => {
       `📸 Screenshot Received!\n\n` +
       `Order ID: ${orderId}\n` +
       `Type: ${typeLabel}\n` +
-      `Country: ${countryLabel}\n` +
+      `Country: ${cLabel}\n` +
       `Accounts: ${st.quantity}\n` +
       `Amount: ₹${st.price}\n\n` +
       `Admin is verifying your purchase. Once approved, you'll be connected with admin right here.`,
@@ -1468,7 +1512,7 @@ bot.on("photo", async msg => {
         `User: ${users[chatId]?.name || "Unknown"} (${chatId})\n` +
         `Username: @${users[chatId]?.username || "N/A"}\n` +
         `Type: ${typeLabel}\n` +
-        `Country: ${countryLabel}\n` +
+        `Country: ${cLabel}\n` +
         `Quantity: ${st.quantity}\n` +
         `Amount: ₹${st.price}\n` +
         `Time: ${new Date().toLocaleString("en-IN")}`,
@@ -1480,7 +1524,7 @@ bot.on("photo", async msg => {
       },
     }).catch(() => {
       bot.sendMessage(ADMIN_ID,
-        `New Account Order!\nOrder: ${orderId}\nUser: ${users[chatId]?.name} (${chatId})\nType: ${typeLabel}\nCountry: ${countryLabel}\nQty: ${st.quantity}\nAmount: ₹${st.price}\nScreenshot forward failed.`,
+        `New Account Order!\nOrder: ${orderId}\nUser: ${users[chatId]?.name} (${chatId})\nType: ${typeLabel}\nCountry: ${cLabel}\nQty: ${st.quantity}\nAmount: ₹${st.price}\nScreenshot forward failed.`,
         { reply_markup: { inline_keyboard: [[{ text: "✅ Approve", callback_data: `accord_approve_${orderId}` }, { text: "❌ Reject", callback_data: `accord_reject_${orderId}` }]] } }
       ).catch(() => { });
     });
