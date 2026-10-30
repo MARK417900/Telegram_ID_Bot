@@ -20,11 +20,21 @@ const GROUP_INVITE_LINK = "https://t.me/+pNRg_oJqSaFlZWE1";
 const REFER_REWARD = 10;
 
 // ─── BUY ACCOUNT CONFIG ────────────────────────────────────────────────────
-const ACCOUNT_PRICE = 40; // ₹ per account — change to whatever price you want
+// Each account type has its own label and price (₹ per account). Change freely.
+const ACCOUNT_TYPES = {
+  whatsapp: { label: "📱 WhatsApp", price: 40 },
+  telegram: { label: "✈️ Telegram", price: 40 },
+};
 const ACCOUNT_MAX_QTY = 10;
+const ADD_STOCK_MAX_QTY = 500;
 const PAYMENT_QR = "https://raw.githubusercontent.com/MARK417900/telegram-invite-bot/main/PaymentQR.jpg";
+const UPI_ID = "7891624054@mbk";
 
-// ─── FIX 3: Escape special Markdown characters in user-supplied text ──────────
+// ─── DEPOSIT CONFIG ───────────────────────────────────────────────────────────
+const MIN_DEPOSIT = 10;
+const MAX_DEPOSIT = 10000;
+
+// ─── Escape special Markdown characters in user-supplied text ─────────────────
 function escMD(text) {
   if (!text) return "";
   return String(text).replace(/[*`\[]/g, "\\$&");
@@ -34,7 +44,8 @@ function escMD(text) {
 let users = {};
 let pendingDeposits = {};
 let pendingAccountOrders = {};
-let stockItems = [];          // pool of account strings available to sell, e.g. "email:pass"
+// Pool of account strings available to sell, per type, e.g. "email:pass" / "+91xxxx:otp"
+let stock = { whatsapp: [], telegram: [] };
 let adminReplyMap = {};       // { adminMessageId: userChatId } — lets admin swipe-reply to relay a message back to a user
 let botOnline = true;
 let adminState = {};
@@ -43,6 +54,12 @@ let userState = {};
 function genOrderId() {
   return "ACC" + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 1000);
 }
+
+function genTxnId() {
+  return "TXN" + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 1000);
+}
+
+const totalStock = () => Object.values(stock).reduce((s, arr) => s + arr.length, 0);
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 const isAdmin = (id) => id === ADMIN_ID;
@@ -54,6 +71,7 @@ function registerUser(msg, referredBy = null) {
       name: `${msg.from.first_name} ${msg.from.last_name || ""}`.trim(),
       username: msg.from.username || "N/A",
       status: "idle",
+      balance: 0,
       hasDeposited: false,
       referredBy: referredBy,
       referRewardPaid: false,
@@ -61,23 +79,6 @@ function registerUser(msg, referredBy = null) {
     };
   }
 }
-
-function ensureUser(from) {
-  if (!users[from.id]) {
-    users[from.id] = {
-      name: `${from.first_name} ${from.last_name || ""}`.trim(),
-      username: from.username || "N/A",
-      status: "idle",
-      tableId: null,
-      hasDeposited: false,
-      referredBy: null,
-      referRewardPaid: false,
-      referCount: 0,
-    };
-  }
-  return users[from.id];
-}
-
 
 function dname(chatId) {
   const u = users[chatId];
@@ -95,7 +96,7 @@ function mainMenu() {
     reply_markup: {
       keyboard: [
         [{ text: "👤 Profile" }, { text: "Stock" }],
-        [{ text: "🛒 Buy Account" }],
+        [{ text: "🛒 Buy Account" }, { text: "💰 Deposit" }],
         [{ text: "🤝 Refer & Earn" }, { text: "🆘 Support" }],
       ],
       resize_keyboard: true,
@@ -126,7 +127,30 @@ const cancelKb = (label = "❌ Cancel") => ({
   },
 });
 
-// ─── BUY ACCOUNT QUANTITY KEYBOARD ─────────────────────────────────────────
+// ─── BUY ACCOUNT: TYPE + QUANTITY KEYBOARDS ─────────────────────────────────
+function accountTypeKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: ACCOUNT_TYPES.whatsapp.label, callback_data: "buyacc_type_whatsapp" },
+          { text: ACCOUNT_TYPES.telegram.label, callback_data: "buyacc_type_telegram" },
+        ],
+        [{ text: "❌ Cancel", callback_data: "buyacc_cancel" }],
+      ],
+    },
+  };
+}
+
+function accountTypeText() {
+  return (
+    `🛒 Buy Account\n\n` +
+    `Which type of account do you want?\n\n` +
+    `${ACCOUNT_TYPES.whatsapp.label} — ₹${ACCOUNT_TYPES.whatsapp.price} each (In stock: ${stock.whatsapp.length})\n` +
+    `${ACCOUNT_TYPES.telegram.label} — ₹${ACCOUNT_TYPES.telegram.price} each (In stock: ${stock.telegram.length})`
+  );
+}
+
 function buyAccountQtyKeyboard(qty) {
   return {
     reply_markup: {
@@ -145,12 +169,13 @@ function buyAccountQtyKeyboard(qty) {
   };
 }
 
-function buyAccountQtyText(qty) {
+function buyAccountQtyText(accType, qty) {
+  const t = ACCOUNT_TYPES[accType];
   return (
-    `🛒 Buy Account\n\n` +
+    `🛒 Buy ${t.label} Account\n\n` +
     `How many accounts would you like to buy?\n\n` +
-    `Price: ₹${ACCOUNT_PRICE} per account\n` +
-    `Total: ₹${qty * ACCOUNT_PRICE}`
+    `Price: ₹${t.price} per account\n` +
+    `Total: ₹${qty * t.price}`
   );
 }
 
@@ -193,63 +218,6 @@ async function requireGroupMembership(chatId, onSuccess) {
         ],
       },
     });
-}
-
-function timeoutPendingAccept(tableId) {
-  const t = tables[tableId];
-  if (!t || t.status !== "pending_accept") return;
-  t.status = "cancelled";
-  [t.creatorId, t.opponentId].forEach(pid => {
-    if (!pid || !users[pid]) return;
-    users[pid].balance += t.entryFee;
-    users[pid].status = "idle";
-    users[pid].tableId = null;
-    send(pid,
-      `⏰ Match timed out!\n\nOpponent did not respond in time.\nRefund: ₹${t.entryFee} | Balance: ₹${users[pid].balance}`,
-      mainMenu());
-  });
-}
-
-
-
-function sendUserInfoPanel(adminChatId, targetId) {
-  const u = users[targetId];
-  if (!u) { send(adminChatId, `❌ User ${targetId} not found.`); return; }
-  const pendingDep = Object.values(pendingDeposits).find(d => d.chatId === targetId && d.status === "pending");
-  const pendingWdl = Object.values(pendingWithdrawals).find(w => w.chatId === targetId && w.status === "pending");
-
-  const text =
-    `👤 User Info\n\n` +
-    `ID: \`${targetId}\`\n` +
-    `Name: ${u.name}\n` +
-    `Username: @${u.username}\n\n` +
-    `Balance: ₹${u.balance}\n` +
-    `Games Played: ${u.gamesPlayed}\n` +
-    `Games Won: ${u.gamesWon}\n` +
-    `Status: ${u.status}\n` +
-    `Table: ${u.tableId || "None"}\n\n` +
-    `Deposited: ${u.hasDeposited ? "Yes ✅" : "No ❌"}\n` +
-    `Referred By: ${u.referredBy ? `\`${u.referredBy}\`` : "None"}\n` +
-    `Refer Count: ${u.referCount || 0}\n` +
-    (pendingDep ? `\nPending Deposit: ₹${pendingDep.amount} (${pendingDep.txnId})\n` : "") +
-    (pendingWdl ? `\nPending Withdrawal: ₹${pendingWdl.amount} (${pendingWdl.txnId})\n` : "");
-
-  bot.sendMessage(adminChatId, text, {
-    parse_mode: "Markdown",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🔄 Reset User State", callback_data: `reset_state_${targetId}` }],
-      ]
-    },
-  }).catch(() => {
-    send(adminChatId, text.replace(/[`*_\[\]]/g, ""), {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "🔄 Reset User State", callback_data: `reset_state_${targetId}` }],
-        ]
-      },
-    });
-  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,9 +271,6 @@ bot.on("message", msg => {
   if (isAdmin(chatId)) {
 
     // ── SWIPE-REPLY RELAY: admin replies to a forwarded user message ────────
-    // In Telegram, swiping right on a message (or "press & hold → Reply") sets
-    // msg.reply_to_message to that message. We map that back to the user it
-    // came from and relay the admin's reply straight to them.
     if (msg.reply_to_message && adminReplyMap[msg.reply_to_message.message_id] && text) {
       const targetUserId = adminReplyMap[msg.reply_to_message.message_id];
       if (users[targetUserId]) {
@@ -378,13 +343,54 @@ bot.on("message", msg => {
         return;
       }
 
-      // ── ADD STOCK ───────────────────────────────────────────────────────
-      if (st.action === "add_stock") {
+      // ── ADD STOCK — STEP 2: QUANTITY ────────────────────────────────────
+      if (st.action === "add_stock_qty") {
+        if (!text || !/^\d+$/.test(text.trim())) {
+          send(chatId, "❌ Please send a valid number (e.g. 5), or tap Cancel.", cancelKb());
+          return;
+        }
+        const qty = parseInt(text.trim(), 10);
+        if (qty < 1 || qty > ADD_STOCK_MAX_QTY) {
+          send(chatId, `❌ Quantity must be between 1 and ${ADD_STOCK_MAX_QTY}.`, cancelKb());
+          return;
+        }
+        adminState[chatId] = { action: "add_stock_items", type: st.type, qty };
+        send(chatId,
+          `📦 Adding ${qty} ${ACCOUNT_TYPES[st.type].label} account${qty > 1 ? "s" : ""}\n\n` +
+          `Now send exactly ${qty} account detail${qty > 1 ? "s" : ""}, one per line. Example:\n` +
+          `user1@mail.com:pass123\n` +
+          `user2@mail.com:pass456`,
+          cancelKb());
+        return;
+      }
+
+      // ── ADD STOCK — STEP 3: ACCOUNT DETAILS → PREVIEW + CONFIRM ─────────
+      if (st.action === "add_stock_items") {
+        if (!text) { send(chatId, "❌ Please send the account details as text.", cancelKb()); return; }
         const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-        if (!lines.length) { send(chatId, "❌ No valid lines found. Send at least one item, or tap Cancel."); return; }
-        stockItems.push(...lines);
-        delete adminState[chatId];
-        send(chatId, `✅ Added ${lines.length} item(s) to stock.\n📦 Total stock now: ${stockItems.length}`, adminMenu());
+        if (lines.length !== st.qty) {
+          send(chatId,
+            `❌ You said ${st.qty} but sent ${lines.length} line${lines.length === 1 ? "" : "s"}.\n` +
+            `Send exactly ${st.qty} line${st.qty > 1 ? "s" : ""} (one account per line), or tap Cancel.`,
+            cancelKb());
+          return;
+        }
+        adminState[chatId] = { action: "add_stock_confirm", type: st.type, items: lines };
+        const preview = lines.slice(0, 10).join("\n") + (lines.length > 10 ? `\n… and ${lines.length - 10} more` : "");
+        send(chatId,
+          `📦 Confirm Stock\n\n` +
+          `Type: ${ACCOUNT_TYPES[st.type].label}\n` +
+          `Quantity: ${lines.length}\n\n` +
+          `${preview}\n\n` +
+          `Add these to stock?`,
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "✅ Confirm", callback_data: "addstock_confirm" },
+                { text: "❌ Cancel", callback_data: "addstock_cancel" },
+              ]]
+            },
+          });
         return;
       }
 
@@ -399,6 +405,7 @@ bot.on("message", msg => {
         send(order.chatId,
           `✅ Your account purchase has been approved!\n\n` +
           `Order ID: ${st.orderId}\n` +
+          `Type: ${ACCOUNT_TYPES[order.accType]?.label || order.accType}\n` +
           `Accounts: ${order.quantity}\n` +
           `Amount Paid: ₹${order.price}\n\n` +
           `Your account details:\n${text}`,
@@ -419,15 +426,25 @@ bot.on("message", msg => {
       send(chatId, "Enter User ID:", cancelKb());
       return;
     }
+    // ── ADD STOCK — STEP 1: CHOOSE TYPE ─────────────────────────────────────
     if (text === "📦 Add Stock") {
-      adminState[chatId] = { action: "add_stock" };
+      delete adminState[chatId];
       send(chatId,
         `📦 Add Stock\n\n` +
-        `Send account details, one per line. Example:\n` +
-        `user1@mail.com:pass123\n` +
-        `user2@mail.com:pass456\n\n` +
-        `Current stock: ${stockItems.length}`,
-        cancelKb());
+        `Which type of accounts do you want to add?\n\n` +
+        `${ACCOUNT_TYPES.whatsapp.label}: ${stock.whatsapp.length} in stock\n` +
+        `${ACCOUNT_TYPES.telegram.label}: ${stock.telegram.length} in stock`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: ACCOUNT_TYPES.whatsapp.label, callback_data: "addstock_type_whatsapp" },
+                { text: ACCOUNT_TYPES.telegram.label, callback_data: "addstock_type_telegram" },
+              ],
+              [{ text: "❌ Cancel", callback_data: "addstock_cancel" }],
+            ],
+          },
+        });
       return;
     }
     if (text === "📊 Bot Status") {
@@ -448,7 +465,9 @@ bot.on("message", msg => {
         `📊 Bot Status\n\n` +
         `Status: ${botOnline ? "🟢 Online" : "🔴 Offline"}\n` +
         `Total Users: ${totalUsers}\n` +
-        `📦 Stock Available: ${stockItems.length}\n` +
+        `📦 Stock Available: ${totalStock()}\n` +
+        `   ${ACCOUNT_TYPES.whatsapp.label}: ${stock.whatsapp.length}\n` +
+        `   ${ACCOUNT_TYPES.telegram.label}: ${stock.telegram.length}\n` +
         `Pending Orders: ${pendingOrders}\n` +
         `Pending Deposits: ${pendingDepositsCount}\n` +
         `━━━━━━━━━━━━━━━━\n` +
@@ -473,7 +492,7 @@ bot.on("message", msg => {
       for (let i = 0; i < all.length; i += 50) chunks.push(all.slice(i, i + 50));
       chunks.forEach((ch, idx) => {
         let m = idx === 0 ? `Total Users: ${all.length}:\n\n` : `Continued...\n\n`;
-        ch.forEach(id => { const u = users[id]; m += `ID: ${id} | ${u.name} | ₹${u.balance} | ${u.status}\n`; });
+        ch.forEach(id => { const u = users[id]; m += `ID: ${id} | ${u.name} | ₹${u.balance || 0} | ${u.status}\n`; });
         send(chatId, m);
       });
       return;
@@ -517,8 +536,62 @@ bot.on("message", msg => {
       return;
     }
 
-    // ── BUY ACCOUNT: SCREENSHOT STAGE ───────────────────────────────────────
+    // ── DEPOSIT: AMOUNT STAGE ───────────────────────────────────────────────
+    if (st.action === "deposit_amount") {
+      if (!text) return;
+      if (text === "❌ Cancel") {
+        delete userState[chatId];
+        send(chatId, "❌ Deposit cancelled.", mainMenu());
+        return;
+      }
+      if (!/^\d+$/.test(text.trim())) {
+        send(chatId, "❌ Please enter a valid amount in numbers only (e.g. 100), or tap Cancel.", cancelKb());
+        return;
+      }
+      const amount = parseInt(text.trim(), 10);
+      if (amount < MIN_DEPOSIT || amount > MAX_DEPOSIT) {
+        send(chatId, `❌ Amount must be between ₹${MIN_DEPOSIT} and ₹${MAX_DEPOSIT}.`, cancelKb());
+        return;
+      }
+      const existing = Object.values(pendingDeposits).find(d => d.chatId === chatId && d.status === "pending");
+      if (existing) {
+        delete userState[chatId];
+        send(chatId, `⏳ You already have a pending deposit: ${existing.txnId} | ₹${existing.amount}\nPlease wait for admin to verify it.`, mainMenu());
+        return;
+      }
+      userState[chatId] = { action: "deposit_qr", amount };
+      bot.sendPhoto(chatId, PAYMENT_QR, {
+        caption:
+          `💰 Deposit ₹${amount}\n\n` +
+          `Amount to Pay: ₹${amount}\n\n` +
+          `UPI ID: ${tapCopy(UPI_ID)}\n\n` +
+          `📷 After payment, tap "I Have Paid" and upload the screenshot.`,
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ I Have Paid", callback_data: "dep_paid" },
+            { text: "❌ Cancel", callback_data: "dep_cancel_qr" },
+          ]]
+        },
+      }).catch(() => { });
+      return;
+    }
+
+    // ── DEPOSIT: SCREENSHOT STAGE (text received instead of photo) ──────────
+    if (st.action === "deposit_screenshot") {
+      if (!text) return; // photo is handled by the photo handler
+      if (text === "❌ Cancel Deposit") {
+        delete userState[chatId];
+        send(chatId, "❌ Deposit cancelled.", mainMenu());
+        return;
+      }
+      send(chatId, "📸 Please send a screenshot image as proof, not text.");
+      return;
+    }
+
+    // ── BUY ACCOUNT: SCREENSHOT STAGE (text received instead of photo) ──────
     if (st.action === "buy_account_screenshot") {
+      if (!text) return; // photo is handled by the photo handler
       if (text === "❌ Cancel Purchase") {
         delete userState[chatId];
         send(chatId, "❌ Purchase cancelled.", mainMenu());
@@ -528,6 +601,8 @@ bot.on("message", msg => {
       return;
     }
   }
+
+  if (!text) return;
 
   if (text === "👤 Profile") {
     const u = users[chatId] || {};
@@ -546,26 +621,41 @@ bot.on("message", msg => {
   if (text === "Stock") {
     send(chatId,
       `📦 Stock Status\n\n` +
-      `Available Accounts: ${stockItems.length}\n` +
-      `Price: ₹${ACCOUNT_PRICE} per account\n\n` +
-      (stockItems.length > 0
+      `${ACCOUNT_TYPES.whatsapp.label}: ${stock.whatsapp.length} available — ₹${ACCOUNT_TYPES.whatsapp.price} each\n` +
+      `${ACCOUNT_TYPES.telegram.label}: ${stock.telegram.length} available — ₹${ACCOUNT_TYPES.telegram.price} each\n\n` +
+      (totalStock() > 0
         ? `Tap "🛒 Buy Account" to purchase now!`
         : `Currently out of stock. Please check back later.`),
       mainMenu());
     return;
   }
 
-  // ── BUY ACCOUNT: START ──────────────────────────────────────────────────
+  // ── DEPOSIT: START ────────────────────────────────────────────────────────
+  if (text === "💰 Deposit") {
+    requireGroupMembership(chatId, () => {
+      const existing = Object.values(pendingDeposits).find(d => d.chatId === chatId && d.status === "pending");
+      if (existing) {
+        send(chatId, `⏳ You already have a pending deposit: ${existing.txnId} | ₹${existing.amount}\nPlease wait for admin to verify it.`, mainMenu());
+        return;
+      }
+      userState[chatId] = { action: "deposit_amount" };
+      send(chatId,
+        `💰 Deposit\n\nEnter the amount you want to deposit (₹${MIN_DEPOSIT} – ₹${MAX_DEPOSIT}):`,
+        cancelKb());
+    });
+    return;
+  }
+
+  // ── BUY ACCOUNT: START (CHOOSE TYPE) ──────────────────────────────────────
   if (text === "🛒 Buy Account") {
     requireGroupMembership(chatId, () => {
-      userState[chatId] = { action: "buy_account_qty", quantity: 1 };
-      send(chatId, buyAccountQtyText(1), buyAccountQtyKeyboard(1));
+      userState[chatId] = { action: "buy_account_type" };
+      send(chatId, accountTypeText(), accountTypeKeyboard());
     });
     return;
   }
 
   if (text === "🤝 Refer & Earn") {
-    const u = users[chatId] || {};
     sendMD(chatId,
       `🤝 Your Referral Link:\n` +
       `${`https://t.me/TgStoreBot?start=${chatId}`}\n\n` +
@@ -595,7 +685,6 @@ bot.on("callback_query", query => {
   const msgId = query.message.message_id;
   const isGroupCallback = query.message.chat.type !== "private";
   const chatId = isGroupCallback ? query.from.id : query.message.chat.id;
-  const groupChatId = query.message.chat.id;
 
   bot.answerCallbackQuery(query.id).catch(() => { });
 
@@ -615,7 +704,7 @@ bot.on("callback_query", query => {
             reply_markup: {
               inline_keyboard: [
                 [{ text: "✅ Join Our Group", url: GROUP_INVITE_LINK }],
-                [{ text: "▶️ I've Joined — Start Playing", callback_data: "check_membership" }],
+                [{ text: "▶️ I've Joined — Continue", callback_data: "check_membership" }],
               ]
             },
           });
@@ -632,14 +721,129 @@ bot.on("callback_query", query => {
     return;
   }
 
+  // ══════════════════ ADMIN: ADD STOCK FLOW ══════════════════════════════════
+  // Step 1 → pick type
+  if (data.startsWith("addstock_type_")) {
+    if (!isAdmin(chatId)) return;
+    const type = data.replace("addstock_type_", "");
+    if (!ACCOUNT_TYPES[type]) return;
+    adminState[chatId] = { action: "add_stock_qty", type };
+    bot.deleteMessage(chatId, msgId).catch(() => { });
+    send(chatId,
+      `📦 Add ${ACCOUNT_TYPES[type].label} Stock\n\n` +
+      `How many accounts do you want to add? Send a number (1 – ${ADD_STOCK_MAX_QTY}).\n\n` +
+      `Current ${ACCOUNT_TYPES[type].label} stock: ${stock[type].length}`,
+      cancelKb());
+    return;
+  }
+
+  // Step 4 → confirm and add
+  if (data === "addstock_confirm") {
+    if (!isAdmin(chatId)) return;
+    const st = adminState[chatId];
+    if (!st || st.action !== "add_stock_confirm") return;
+    stock[st.type].push(...st.items);
+    const added = st.items.length;
+    const label = ACCOUNT_TYPES[st.type].label;
+    const nowCount = stock[st.type].length;
+    delete adminState[chatId];
+    bot.deleteMessage(chatId, msgId).catch(() => { });
+    send(chatId,
+      `✅ Added ${added} ${label} account${added > 1 ? "s" : ""} to stock.\n` +
+      `📦 ${label} stock now: ${nowCount}\n` +
+      `📦 Total stock: ${totalStock()}`,
+      adminMenu());
+    return;
+  }
+
+  if (data === "addstock_cancel") {
+    if (!isAdmin(chatId)) return;
+    delete adminState[chatId];
+    bot.deleteMessage(chatId, msgId).catch(() => { });
+    send(chatId, "❌ Add stock cancelled.", adminMenu());
+    return;
+  }
+
+  // ══════════════════ DEPOSIT FLOW ═══════════════════════════════════════════
+  if (data === "dep_cancel_qr") {
+    delete userState[chatId];
+    bot.deleteMessage(chatId, msgId).catch(() => { });
+    send(chatId, "❌ Deposit cancelled.", mainMenu());
+    return;
+  }
+
+  if (data === "dep_paid") {
+    const st = userState[chatId];
+    if (!st || st.action !== "deposit_qr") return;
+    bot.deleteMessage(chatId, msgId).catch(() => { });
+    userState[chatId] = { action: "deposit_screenshot", amount: st.amount };
+    send(chatId,
+      `📷 Please upload the payment screenshot.\n\n⚠ Screenshot must contain the UTR number.`,
+      cancelKb("❌ Cancel Deposit"));
+    return;
+  }
+
+  // ── DEPOSIT: ADMIN APPROVE / REJECT ─────────────────────────────────────────
+  if (data.startsWith("dep_approve_") || data.startsWith("dep_reject_")) {
+    if (!isAdmin(chatId)) return;
+    const isApprove = data.startsWith("dep_approve_");
+    const txnId = data.replace(isApprove ? "dep_approve_" : "dep_reject_", "");
+    const dep = pendingDeposits[txnId];
+    if (!dep || dep.status !== "pending") {
+      send(chatId, "❌ Deposit not found or already processed.");
+      return;
+    }
+    const u = users[dep.chatId];
+
+    if (!isApprove) {
+      dep.status = "rejected";
+      send(chatId, `❌ Deposit ${txnId} rejected.`);
+      send(dep.chatId,
+        `❌ Your deposit request was rejected.\n\n` +
+        `TXN ID: ${txnId}\nAmount: ₹${dep.amount}\n\n` +
+        `Please contact support if you believe this is a mistake.`,
+        mainMenu());
+      return;
+    }
+
+    dep.status = "approved";
+    if (u) {
+      u.balance = (u.balance || 0) + dep.amount;
+      u.hasDeposited = true;
+    }
+    send(chatId, `✅ Deposit ${txnId} approved. ₹${dep.amount} credited to ${u?.name || dep.chatId}.`);
+    send(dep.chatId,
+      `✅ Your deposit has been approved!\n\n` +
+      `TXN ID: ${txnId}\n` +
+      `Amount Added: ₹${dep.amount}\n` +
+      `New Balance: ₹${u?.balance ?? dep.amount}`,
+      mainMenu());
+    return;
+  }
+
+  // ══════════════════ BUY ACCOUNT FLOW ═══════════════════════════════════════
+  // ── BUY ACCOUNT: TYPE SELECTED (WhatsApp / Telegram) → QUANTITY ─────────────
+  if (data.startsWith("buyacc_type_")) {
+    const accType = data.replace("buyacc_type_", "");
+    if (!ACCOUNT_TYPES[accType]) return;
+    userState[chatId] = { action: "buy_account_qty", accType, quantity: 1 };
+    bot.editMessageText(buyAccountQtyText(accType, 1), {
+      chat_id: chatId,
+      message_id: msgId,
+      reply_markup: buyAccountQtyKeyboard(1).reply_markup,
+    }).catch(() => { });
+    return;
+  }
+
   // ── BUY ACCOUNT: QUANTITY STEPPER ──────────────────────────────────────────
   if (data === "buyacc_minus" || data === "buyacc_plus") {
     const st = userState[chatId];
     if (!st || st.action !== "buy_account_qty") return;
     let qty = st.quantity;
     qty = data === "buyacc_plus" ? Math.min(ACCOUNT_MAX_QTY, qty + 1) : Math.max(1, qty - 1);
+    if (qty === st.quantity) return;
     st.quantity = qty;
-    bot.editMessageText(buyAccountQtyText(qty), {
+    bot.editMessageText(buyAccountQtyText(st.accType, qty), {
       chat_id: chatId,
       message_id: msgId,
       reply_markup: buyAccountQtyKeyboard(qty).reply_markup,
@@ -647,7 +851,7 @@ bot.on("callback_query", query => {
     return;
   }
 
-  // ── BUY ACCOUNT: CANCEL AT QUANTITY STAGE ───────────────────────────────────
+  // ── BUY ACCOUNT: CANCEL (TYPE OR QUANTITY STAGE) ────────────────────────────
   if (data === "buyacc_cancel") {
     delete userState[chatId];
     bot.editMessageText("❌ Purchase cancelled.", { chat_id: chatId, message_id: msgId }).catch(() => { });
@@ -659,15 +863,16 @@ bot.on("callback_query", query => {
   if (data === "buyacc_confirm") {
     const st = userState[chatId];
     if (!st || st.action !== "buy_account_qty") return;
-    const qty = st.quantity;
-    const price = qty * ACCOUNT_PRICE;
+    const { accType, quantity: qty } = st;
+    const t = ACCOUNT_TYPES[accType];
+    const price = qty * t.price;
     bot.deleteMessage(chatId, msgId).catch(() => { });
-    userState[chatId] = { action: "buy_account_qr", quantity: qty, price };
+    userState[chatId] = { action: "buy_account_qr", accType, quantity: qty, price };
     bot.sendPhoto(chatId, PAYMENT_QR, {
       caption:
-        `🛒 Buy ${qty} Account${qty > 1 ? "s" : ""}\n\n` +
+        `🛒 Buy ${qty} ${t.label} Account${qty > 1 ? "s" : ""}\n\n` +
         `Amount to Pay: ₹${price}\n\n` +
-        `UPI ID: ${tapCopy("7891624054@mbk")}\n\n` +
+        `UPI ID: ${tapCopy(UPI_ID)}\n\n` +
         `📷 After payment, tap "I Have Paid" and upload the screenshot.`,
       parse_mode: "Markdown",
       reply_markup: {
@@ -693,16 +898,10 @@ bot.on("callback_query", query => {
     const st = userState[chatId];
     if (!st || st.action !== "buy_account_qr") return;
     bot.deleteMessage(chatId, msgId).catch(() => { });
-    userState[chatId] = { action: "buy_account_screenshot", quantity: st.quantity, price: st.price };
+    userState[chatId] = { action: "buy_account_screenshot", accType: st.accType, quantity: st.quantity, price: st.price };
     send(chatId,
       `📷 Please upload the payment screenshot.\n\n⚠ Screenshot must contain the UTR number.`,
-      {
-        reply_markup: {
-          keyboard: [[{ text: "❌ Cancel Purchase" }]],
-          resize_keyboard: true,
-          one_time_keyboard: true,
-        },
-      });
+      cancelKb("❌ Cancel Purchase"));
     return;
   }
 
@@ -716,6 +915,7 @@ bot.on("callback_query", query => {
       send(chatId, "❌ Order not found or already processed.");
       return;
     }
+    const typeLabel = ACCOUNT_TYPES[order.accType]?.label || order.accType;
 
     if (!isApprove) {
       order.status = "rejected";
@@ -728,19 +928,22 @@ bot.on("callback_query", query => {
       return;
     }
 
-    // Approve — try to auto-deliver from stock first
-    if (stockItems.length >= order.quantity) {
-      const delivered = stockItems.splice(0, order.quantity);
+    // Approve — try to auto-deliver from the matching stock pool first
+    const pool = stock[order.accType] || [];
+    if (pool.length >= order.quantity) {
+      const delivered = pool.splice(0, order.quantity);
       order.status = "approved";
       order.deliveredItems = delivered;
       send(chatId,
         `✅ Order ${orderId} approved & auto-delivered from stock.\n` +
         `User: ${users[order.chatId]?.name || order.chatId}\n` +
+        `Type: ${typeLabel}\n` +
         `Qty: ${order.quantity}\n` +
-        `Remaining Stock: ${stockItems.length}`);
+        `Remaining ${typeLabel} Stock: ${pool.length}`);
       sendMD(order.chatId,
         `✅ Your account purchase has been approved!\n\n` +
         `Order ID: ${orderId}\n` +
+        `Type: ${typeLabel}\n` +
         `Accounts: ${order.quantity}\n` +
         `Amount Paid: ₹${order.price}\n\n` +
         `Your account details:\n` +
@@ -750,26 +953,10 @@ bot.on("callback_query", query => {
       // Not enough stock — ask admin to type the delivery message manually
       adminState[chatId] = { action: "deliver_account_manual", orderId };
       send(chatId,
-        `⚠️ Not enough stock! (Have ${stockItems.length}, need ${order.quantity})\n\n` +
+        `⚠️ Not enough ${typeLabel} stock! (Have ${pool.length}, need ${order.quantity})\n\n` +
         `Type the account details to send to the user manually, or tap 📦 Add Stock first and then approve again.`,
         cancelKb());
     }
-    return;
-  }
-
-  if (data.startsWith("reset_state_")) {
-    const tid = parseInt(data.replace("reset_state_", ""));
-    if (!users[tid]) { send(chatId, "❌ User not found."); return; }
-    const u = users[tid];
-    if (u.tableId && tables[u.tableId]) {
-      const t = tables[u.tableId];
-      if (!["completed", "cancelled"].includes(t.status)) cancelTable(u.tableId, "reset by admin");
-    }
-    u.status = "idle";
-    u.tableId = null;
-    delete userState[tid];
-    send(chatId, `✅ User ${u.name} (${tid}) state has been reset to idle.`);
-    send(tid, `🔄 Your account state was reset by admin.\n\nIf you had a pending game it has been cancelled and your entry fee refunded.`, mainMenu());
     return;
   }
 });
@@ -796,6 +983,7 @@ bot.on("photo", msg => {
   const st = userState[chatId];
   if (!st) return;
 
+  // ── DEPOSIT: SCREENSHOT RECEIVED → SEND TO ADMIN ────────────────────────────
   if (st.action === "deposit_screenshot") {
     const ep = Object.values(pendingDeposits).find(d => d.chatId === chatId && d.status === "pending");
     if (ep) {
@@ -841,9 +1029,11 @@ bot.on("photo", msg => {
   if (st.action === "buy_account_screenshot") {
     const fileId = msg.photo[msg.photo.length - 1].file_id;
     const orderId = genOrderId();
+    const typeLabel = ACCOUNT_TYPES[st.accType]?.label || st.accType;
     pendingAccountOrders[orderId] = {
       orderId,
       chatId,
+      accType: st.accType,
       quantity: st.quantity,
       price: st.price,
       screenshotFileId: fileId,
@@ -855,6 +1045,7 @@ bot.on("photo", msg => {
     send(chatId,
       `📸 Screenshot Received!\n\n` +
       `Order ID: ${orderId}\n` +
+      `Type: ${typeLabel}\n` +
       `Accounts: ${st.quantity}\n` +
       `Amount: ₹${st.price}\n\n` +
       `Admin is verifying your purchase. You will be notified.`,
@@ -866,6 +1057,7 @@ bot.on("photo", msg => {
         `Order ID: ${orderId}\n` +
         `User: ${users[chatId]?.name || "Unknown"} (${chatId})\n` +
         `Username: @${users[chatId]?.username || "N/A"}\n` +
+        `Type: ${typeLabel}\n` +
         `Quantity: ${st.quantity}\n` +
         `Amount: ₹${st.price}\n` +
         `Time: ${new Date().toLocaleString("en-IN")}`,
@@ -877,7 +1069,7 @@ bot.on("photo", msg => {
       },
     }).catch(() => {
       bot.sendMessage(ADMIN_ID,
-        `New Account Order!\nOrder: ${orderId}\nUser: ${users[chatId]?.name} (${chatId})\nQty: ${st.quantity}\nAmount: ₹${st.price}\nScreenshot forward failed.`,
+        `New Account Order!\nOrder: ${orderId}\nUser: ${users[chatId]?.name} (${chatId})\nType: ${typeLabel}\nQty: ${st.quantity}\nAmount: ₹${st.price}\nScreenshot forward failed.`,
         { reply_markup: { inline_keyboard: [[{ text: "✅ Approve", callback_data: `accord_approve_${orderId}` }, { text: "❌ Reject", callback_data: `accord_reject_${orderId}` }]] } }
       ).catch(() => { });
     });
