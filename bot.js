@@ -14,7 +14,7 @@ app.listen(PORT, () => {
 });
 const token = process.env.BOT_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
-const ADMIN_ID = 8384096916;
+const ADMIN_ID = 8521844327;
 
 // ─── REQUIRED CHANNEL (users must join before ANYTHING works) ────────────────
 // ⚠️ Set these two (env vars on your host, or edit the fallback values):
@@ -91,22 +91,26 @@ function resolveCountry(rawName) {
   return { key, label: "🌍 " + titleCase(name) };
 }
 
-// "2 indian 3 nepal 4 indoneshia" → [{key,label,count}, ...]  (null if it can't be read)
+// "2 india 40  3 nepal 35" → [{key,label,count,price}, ...]  (quantity, country, price per account)
+// Returns null if it can't be read.
 function parseStockInput(text) {
   const cleaned = text.replace(/[,;\n]+/g, " ").trim();
   if (!/^\d/.test(cleaned)) return null;
-  const re = /(\d+)\s*([^\d]+)/g;
+  const re = /(\d+)\s*([^\d]+?)\s*(\d+)(?=\s|$)/g;
   const merged = {};
   let m;
   while ((m = re.exec(cleaned))) {
     const count = parseInt(m[1], 10);
+    const price = parseInt(m[3], 10);
     const name = m[2].replace(/[^\p{L}\s.'-]/gu, " ").replace(/\s+/g, " ").trim();
-    if (!name || count < 1 || count > ADD_STOCK_MAX_QTY) return null;
+    if (!name || count < 1 || count > ADD_STOCK_MAX_QTY || price < 1 || price > 100000) return null;
     const c = resolveCountry(name);
     if (!c) return null;
-    if (merged[c.key]) merged[c.key].count += count;
-    else merged[c.key] = { key: c.key, label: c.label, count };
+    if (merged[c.key]) { merged[c.key].count += count; merged[c.key].price = price; }
+    else merged[c.key] = { key: c.key, label: c.label, count, price };
   }
+  // everything typed must have been understood (no leftover text)
+  if (cleaned.replace(/(\d+)\s*([^\d]+?)\s*(\d+)(?=\s|$)/g, "").trim() !== "") return null;
   const list = Object.values(merged);
   return list.length ? list : null;
 }
@@ -123,7 +127,9 @@ let pendingDeposits = {};
 let pendingAccountOrders = {};
 // stock[type][countryKey] = number of accounts available
 let stock = {};
-for (const t of Object.keys(ACCOUNT_TYPES)) stock[t] = {};
+// prices[type][countryKey] = ₹ per account (set by admin when adding stock)
+let prices = {};
+for (const t of Object.keys(ACCOUNT_TYPES)) { stock[t] = {}; prices[t] = {}; }
 let countryLabels = {};       // { countryKey: "🇮🇳 India" }
 let adminReplyMap = {};       // { adminMessageId: userChatId } — swipe-reply support messages
 let orderMsgMap = {};         // { adminMessageId: orderId }    — swipe-reply order chat messages
@@ -146,13 +152,23 @@ const typeTotal = (type) => Object.values(stock[type] || {}).reduce((s, n) => s 
 const totalStock = () => Object.keys(ACCOUNT_TYPES).reduce((s, t) => s + typeTotal(t), 0);
 const countriesInStock = (type) => Object.entries(stock[type] || {}).filter(([, n]) => n > 0);
 
+// Price per account for a type+country (falls back to the default in ACCOUNT_TYPES)
+const priceOf = (type, country) => (prices[type] && prices[type][country]) || ACCOUNT_TYPES[type].price;
+
+function priceRangeText(type) {
+  const list = countriesInStock(type).map(([k]) => priceOf(type, k));
+  if (!list.length) return "out of stock";
+  const min = Math.min(...list), max = Math.max(...list);
+  return min === max ? `₹${min} each` : `₹${min} – ₹${max} each`;
+}
+
 function stockSummaryText() {
   let out = "";
   for (const [tk, t] of Object.entries(ACCOUNT_TYPES)) {
-    out += `${t.label} — ₹${t.price} each (total ${typeTotal(tk)})\n`;
+    out += `${t.label} (total ${typeTotal(tk)})\n`;
     const list = countriesInStock(tk);
     if (!list.length) out += `   — out of stock —\n`;
-    for (const [ck, n] of list) out += `   ${countryLabel(ck)}: ${n}\n`;
+    for (const [ck, n] of list) out += `   ${countryLabel(ck)}: ${n} — ₹${priceOf(tk, ck)} each\n`;
     out += "\n";
   }
   return out.trimEnd();
@@ -212,8 +228,8 @@ function adminMenu() {
       keyboard: [
         [{ text: "📢 Broadcast" }, { text: "📊 Bot Status" }],
         [{ text: "👤 MSG User" }, { text: botOnline ? "🔴 Bot OFF" : "🟢 Bot ON" }, { text: "👥 All Users" }],
-        [{ text: "📦 Add Stock" }, { text: "💲 Set Acc. Price" }],
-        [{ text: "💬 Active Orders" }, { text: "🔙 User Menu" }],
+        [{ text: "📦 Add Stock" }, { text: "💬 Active Orders" }],
+        [{ text: "🔙 User Menu" }],
       ],
       resize_keyboard: true,
     },
@@ -226,7 +242,7 @@ function chatKeyboard() {
     reply_markup: {
       keyboard: [
         [{ text: "✅ Order Done" }, { text: "❌ Cancel Order" }],
-        [{ text: "💬 Active Orders" }, { text: "🔙 Admin Menu" }],
+        [{ text: "🔙 Admin Menu" }],
       ],
       resize_keyboard: true,
       persistent: true,
@@ -241,7 +257,7 @@ const adminKb = () => (activeOrders().length ? chatKeyboard() : adminMenu());
 const MENU_TEXTS = new Set([
   "👤 Profile", "💰 Deposit", "Stock", "🛒 Buy Account", "🤝 Refer & Earn", "🆘 Support",
   "📢 Broadcast", "📊 Bot Status", "👤 MSG User", "🔴 Bot OFF", "🟢 Bot ON", "👥 All Users",
-  "📦 Add Stock", "💲 Set Acc. Price", "💬 Active Orders", "🔙 User Menu",
+  "📦 Add Stock", "💬 Active Orders", "🔙 User Menu",
   "✅ Order Done", "❌ Cancel Order", "🔙 Admin Menu",
   "❌ Cancel", "❌ Cancel Deposit", "❌ Cancel Purchase",
 ]);
@@ -269,18 +285,21 @@ function accountTypeText() {
     `🛒 Buy Account\n\n` +
     `Which type of account do you want?\n\n` +
     Object.entries(ACCOUNT_TYPES)
-      .map(([k, t]) => `${t.label} — ₹${t.price} each (In stock: ${typeTotal(k)})`)
+      .map(([k, t]) => `${t.label} — ${priceRangeText(k)} (In stock: ${typeTotal(k)})`)
       .join("\n")
   );
 }
 
 // Country buttons are built automatically from what is currently in stock for this type.
 // prefix + countryKey = callback_data
-function countryKeyboard(prefix, accType, cancelData) {
+function countryKeyboard(prefix, accType, cancelData, showPrice = true) {
   const rows = [];
   let row = [];
   for (const [key, n] of countriesInStock(accType)) {
-    row.push({ text: `${countryLabel(key)} (${n})`, callback_data: `${prefix}${key}` });
+    const label = showPrice
+      ? `${countryLabel(key)} • ₹${priceOf(accType, key)} (${n})`
+      : `${countryLabel(key)} (${n})`;
+    row.push({ text: label, callback_data: `${prefix}${key}` });
     if (row.length === 2) { rows.push(row); row = []; }
   }
   if (row.length) rows.push(row);
@@ -308,7 +327,8 @@ function buyAccountQtyKeyboard(qty) {
 
 function buyAccountQtyText(chatId, accType, country, qty) {
   const t = ACCOUNT_TYPES[accType];
-  const total = qty * t.price;
+  const unit = priceOf(accType, country);
+  const total = qty * unit;
   const bal = users[chatId]?.balance || 0;
   let walletNote = "";
   if (bal >= total) walletNote = `\n\n💰 Wallet: ₹${bal} — this will be paid from your wallet automatically.`;
@@ -317,7 +337,7 @@ function buyAccountQtyText(chatId, accType, country, qty) {
     `🛒 Buy ${t.label} Account (${countryLabel(country)})\n\n` +
     `How many accounts would you like to buy?\n` +
     `In stock: ${stockCount(accType, country)}\n\n` +
-    `Price: ₹${t.price} per account\n` +
+    `Price: ₹${unit} per account\n` +
     `Total: ₹${total}` +
     walletNote
   );
@@ -642,35 +662,15 @@ bot.on("message", async msg => {
         return;
       }
 
-      // ── SET ACCOUNT PRICE: new price typed ──────────────────────────────
-      if (st.action === "set_price") {
-        if (!text || !/^\d+$/.test(text.trim())) {
-          send(chatId, "❌ Send the new price as a whole number (e.g. 45), or tap Cancel.", cancelKb());
-          return;
-        }
-        const price = parseInt(text.trim(), 10);
-        if (price < 1 || price > 100000) {
-          send(chatId, "❌ Price must be between ₹1 and ₹100000.", cancelKb());
-          return;
-        }
-        const old = ACCOUNT_TYPES[st.type].price;
-        ACCOUNT_TYPES[st.type].price = price;
-        delete adminState[chatId];
-        send(chatId,
-          `✅ ${ACCOUNT_TYPES[st.type].label} price updated: ₹${old} → ₹${price} per account.\n` +
-          `(Orders already placed keep their old price.)`,
-          adminKb());
-        return;
-      }
-
       // ── ADD STOCK — STEP 2: "2 india 3 nepal 4 indonesia" → PREVIEW + CONFIRM ──
       if (st.action === "add_stock_input") {
         if (!text) { send(chatId, "❌ Please send the stock as text.", cancelKb()); return; }
         const entries = parseStockInput(text);
         if (!entries) {
           send(chatId,
-            `❌ I couldn't read that.\n\nSend number + country pairs, like:\n2 india 3 nepal 4 indonesia\n\n` +
-            `(each number 1 – ${ADD_STOCK_MAX_QTY}) — or tap Cancel.`,
+            `❌ I couldn't read that.\n\nSend quantity, country and price per account, like:\n2 india 40\n\n` +
+            `Several at once: 2 india 40 3 nepal 35 4 indonesia 30\n` +
+            `(quantity 1 – ${ADD_STOCK_MAX_QTY} each) — or tap Cancel.`,
             cancelKb());
           return;
         }
@@ -679,7 +679,12 @@ bot.on("message", async msg => {
         send(chatId,
           `📦 Confirm Stock\n\n` +
           `Type: ${ACCOUNT_TYPES[st.type].label}\n\n` +
-          entries.map(e => `${e.label}: +${e.count}  (now ${stockCount(st.type, e.key) + e.count})`).join("\n") +
+          entries.map(e =>
+            `${e.label}: +${e.count} @ ₹${e.price} each  (stock → ${stockCount(st.type, e.key) + e.count})` +
+            (stockCount(st.type, e.key) > 0 && priceOf(st.type, e.key) !== e.price
+              ? `\n   ⚠️ price changes ₹${priceOf(st.type, e.key)} → ₹${e.price} for this country`
+              : "")
+          ).join("\n") +
           `\n\nTotal adding: ${total}\n\nAdd this to stock?`,
           {
             reply_markup: {
@@ -714,24 +719,6 @@ bot.on("message", async msg => {
           reply_markup: {
             inline_keyboard: [
               Object.entries(ACCOUNT_TYPES).map(([k, t]) => ({ text: t.label, callback_data: `addstock_type_${k}` })),
-              [{ text: "❌ Cancel", callback_data: "addstock_cancel" }],
-            ],
-          },
-        });
-      return;
-    }
-
-    // ── SET ACCOUNT PRICE: choose type ──────────────────────────────────────
-    if (text === "💲 Set Acc. Price") {
-      delete adminState[chatId];
-      send(chatId,
-        `💲 Set Account Price\n\nCurrent prices:\n` +
-        Object.values(ACCOUNT_TYPES).map(t => `${t.label}: ₹${t.price}`).join("\n") +
-        `\n\nWhich account type do you want to change?`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              Object.entries(ACCOUNT_TYPES).map(([k, t]) => ({ text: t.label, callback_data: `setprice_type_${k}` })),
               [{ text: "❌ Cancel", callback_data: "addstock_cancel" }],
             ],
           },
@@ -1090,11 +1077,14 @@ bot.on("callback_query", async query => {
     bot.deleteMessage(chatId, msgId).catch(() => { });
     send(chatId,
       `📦 Add ${ACCOUNT_TYPES[type].label} Stock\n\n` +
-      `Send how many accounts per country, number first. Example:\n\n` +
-      `2 india 3 nepal 4 indonesia\n\n` +
-      `Buyers will automatically get a button for each country that is in stock.\n\n` +
+      `Send quantity, country and price per account. Example:\n\n` +
+      `2 india 40\n\n` +
+      `Several at once:\n` +
+      `2 india 40 3 nepal 35 4 indonesia 30\n\n` +
+      `Buyers automatically get a button (with the price) for each country in stock. ` +
+      `The price you send becomes the price for that country.\n\n` +
       `Current stock:\n` +
-      (countriesInStock(type).map(([k, n]) => `${countryLabel(k)}: ${n}`).join("\n") || "— none —"),
+      (countriesInStock(type).map(([k, n]) => `${countryLabel(k)}: ${n} @ ₹${priceOf(type, k)}`).join("\n") || "— none —"),
       cancelKb());
     return;
   }
@@ -1107,6 +1097,7 @@ bot.on("callback_query", async query => {
     for (const e of st.entries) {
       countryLabels[e.key] = e.label;
       stock[st.type][e.key] = stockCount(st.type, e.key) + e.count;
+      prices[st.type][e.key] = e.price;
     }
     const added = st.entries.reduce((s, e) => s + e.count, 0);
     const label = ACCOUNT_TYPES[st.type].label;
@@ -1115,7 +1106,7 @@ bot.on("callback_query", async query => {
     bot.deleteMessage(chatId, msgId).catch(() => { });
     send(chatId,
       `✅ Added ${added} ${label} account${added > 1 ? "s" : ""} to stock.\n\n` +
-      countriesInStock(type).map(([k, n]) => `${countryLabel(k)}: ${n}`).join("\n") +
+      countriesInStock(type).map(([k, n]) => `${countryLabel(k)}: ${n} @ ₹${priceOf(type, k)}`).join("\n") +
       `\n\n📦 ${label} total: ${typeTotal(type)}\n📦 All stock: ${totalStock()}`,
       adminKb());
     return;
@@ -1126,19 +1117,6 @@ bot.on("callback_query", async query => {
     delete adminState[chatId];
     bot.deleteMessage(chatId, msgId).catch(() => { });
     send(chatId, "❌ Add stock cancelled.", adminKb());
-    return;
-  }
-
-  // ══════════════════ ADMIN: SET ACCOUNT PRICE ═══════════════════════════════
-  if (data.startsWith("setprice_type_")) {
-    if (!isAdmin(chatId)) return;
-    const type = data.replace("setprice_type_", "");
-    if (!ACCOUNT_TYPES[type]) return;
-    adminState[chatId] = { action: "set_price", type };
-    bot.deleteMessage(chatId, msgId).catch(() => { });
-    send(chatId,
-      `💲 ${ACCOUNT_TYPES[type].label}\nCurrent price: ₹${ACCOUNT_TYPES[type].price} per account.\n\nSend the new price (number only):`,
-      cancelKb());
     return;
   }
 
@@ -1275,7 +1253,7 @@ bot.on("callback_query", async query => {
       return;
     }
     const t = ACCOUNT_TYPES[accType];
-    const price = qty * t.price;
+    const price = qty * priceOf(accType, country);
     bot.deleteMessage(chatId, msgId).catch(() => { });
 
     // ── WALLET PAYMENT: enough balance → deduct instantly, skip QR, start order chat ──
@@ -1410,7 +1388,7 @@ bot.on("callback_query", async query => {
       {
         chat_id: chatId,
         message_id: msgId,
-        reply_markup: countryKeyboard(`refclaim_country_${accType}_`, accType, "refclaim_cancel"),
+        reply_markup: countryKeyboard(`refclaim_country_${accType}_`, accType, "refclaim_cancel", false),
       }
     ).catch(() => { });
     return;
