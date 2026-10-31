@@ -14,7 +14,7 @@ app.listen(PORT, () => {
 });
 const token = process.env.BOT_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
-const ADMIN_ID = 8384096916;
+const ADMIN_ID = 8751167278;
 
 // ─── REQUIRED CHANNEL (users must join before ANYTHING works) ────────────────
 // ⚠️ Set these two (env vars on your host, or edit the fallback values):
@@ -557,7 +557,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   if (!(await passesGate(chatId))) return;
 
   send(chatId,
-    `Welcome in Mark's Community, ${msg.from.first_name}`,
+    `Welcome in PAPUxSTORE, ${msg.from.first_name}`,
     mainMenu());
 });
 
@@ -1009,7 +1009,7 @@ bot.on("message", async msg => {
     send(chatId, "🆘 Support\nChoose an option:", {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "📞 Contact Admin", url: "https://t.me/Mark41_001" }],
+          [{ text: "📞 Contact Admin", url: "https://t.me/TEAMPAPU" }],
           [{ text: "✉️ Message Admin (in bot)", callback_data: "msg_admin_start" }],
         ]
       },
