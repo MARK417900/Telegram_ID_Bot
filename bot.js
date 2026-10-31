@@ -212,8 +212,8 @@ function adminMenu() {
       keyboard: [
         [{ text: "📢 Broadcast" }, { text: "📊 Bot Status" }],
         [{ text: "👤 MSG User" }, { text: botOnline ? "🔴 Bot OFF" : "🟢 Bot ON" }, { text: "👥 All Users" }],
-        [{ text: "📦 Add Stock" }, { text: "💬 Active Orders" }],
-        [{ text: "🔙 User Menu" }],
+        [{ text: "📦 Add Stock" }, { text: "💲 Set Acc. Price" }],
+        [{ text: "💬 Active Orders" }, { text: "🔙 User Menu" }],
       ],
       resize_keyboard: true,
     },
@@ -241,7 +241,7 @@ const adminKb = () => (activeOrders().length ? chatKeyboard() : adminMenu());
 const MENU_TEXTS = new Set([
   "👤 Profile", "💰 Deposit", "Stock", "🛒 Buy Account", "🤝 Refer & Earn", "🆘 Support",
   "📢 Broadcast", "📊 Bot Status", "👤 MSG User", "🔴 Bot OFF", "🟢 Bot ON", "👥 All Users",
-  "📦 Add Stock", "💬 Active Orders", "🔙 User Menu",
+  "📦 Add Stock", "💲 Set Acc. Price", "💬 Active Orders", "🔙 User Menu",
   "✅ Order Done", "❌ Cancel Order", "🔙 Admin Menu",
   "❌ Cancel", "❌ Cancel Deposit", "❌ Cancel Purchase",
 ]);
@@ -306,14 +306,20 @@ function buyAccountQtyKeyboard(qty) {
   };
 }
 
-function buyAccountQtyText(accType, country, qty) {
+function buyAccountQtyText(chatId, accType, country, qty) {
   const t = ACCOUNT_TYPES[accType];
+  const total = qty * t.price;
+  const bal = users[chatId]?.balance || 0;
+  let walletNote = "";
+  if (bal >= total) walletNote = `\n\n💰 Wallet: ₹${bal} — this will be paid from your wallet automatically.`;
+  else if (bal > 0) walletNote = `\n\n💰 Wallet: ₹${bal} (not enough for this order — you'll pay via UPI, or deposit more to use your wallet)`;
   return (
     `🛒 Buy ${t.label} Account (${countryLabel(country)})\n\n` +
     `How many accounts would you like to buy?\n` +
     `In stock: ${stockCount(accType, country)}\n\n` +
     `Price: ₹${t.price} per account\n` +
-    `Total: ₹${qty * t.price}`
+    `Total: ₹${total}` +
+    walletNote
   );
 }
 
@@ -381,7 +387,7 @@ async function passesGate(chatId) {
 // ─── ORDER CHAT (user ↔ admin after approval) ─────────────────────────────────
 const typeLabelOf = (o) => ACCOUNT_TYPES[o.accType]?.label || o.accType;
 const countryLabelOf = (o) => countryLabel(o.country);
-const priceTextOf = (o) => (o.isFree ? "FREE 🎁" : `₹${o.price}`);
+const priceTextOf = (o) => (o.isFree ? "FREE 🎁" : `₹${o.price}${o.paidFromWallet ? " (paid from wallet)" : ""}`);
 
 function activeOrderOfUser(chatId) {
   const list = Object.values(pendingAccountOrders).filter(o => o.chatActive && o.chatId === chatId);
@@ -478,7 +484,7 @@ function closeOrder(orderId, isDone) {
     if (order.isFree && users[order.chatId]) {
       users[order.chatId].freeClaimed = Math.max(0, (users[order.chatId].freeClaimed || 0) - 1);
       extra = `\n\nYour free-account credit has been restored.`;
-    } else if (REFUND_ON_CANCEL && users[order.chatId] && order.price > 0) {
+    } else if ((order.paidFromWallet || REFUND_ON_CANCEL) && users[order.chatId] && order.price > 0) {
       users[order.chatId].balance = (users[order.chatId].balance || 0) + order.price;
       extra = `\n\n₹${order.price} has been added to your bot balance.`;
     }
@@ -636,6 +642,27 @@ bot.on("message", async msg => {
         return;
       }
 
+      // ── SET ACCOUNT PRICE: new price typed ──────────────────────────────
+      if (st.action === "set_price") {
+        if (!text || !/^\d+$/.test(text.trim())) {
+          send(chatId, "❌ Send the new price as a whole number (e.g. 45), or tap Cancel.", cancelKb());
+          return;
+        }
+        const price = parseInt(text.trim(), 10);
+        if (price < 1 || price > 100000) {
+          send(chatId, "❌ Price must be between ₹1 and ₹100000.", cancelKb());
+          return;
+        }
+        const old = ACCOUNT_TYPES[st.type].price;
+        ACCOUNT_TYPES[st.type].price = price;
+        delete adminState[chatId];
+        send(chatId,
+          `✅ ${ACCOUNT_TYPES[st.type].label} price updated: ₹${old} → ₹${price} per account.\n` +
+          `(Orders already placed keep their old price.)`,
+          adminKb());
+        return;
+      }
+
       // ── ADD STOCK — STEP 2: "2 india 3 nepal 4 indonesia" → PREVIEW + CONFIRM ──
       if (st.action === "add_stock_input") {
         if (!text) { send(chatId, "❌ Please send the stock as text.", cancelKb()); return; }
@@ -687,6 +714,24 @@ bot.on("message", async msg => {
           reply_markup: {
             inline_keyboard: [
               Object.entries(ACCOUNT_TYPES).map(([k, t]) => ({ text: t.label, callback_data: `addstock_type_${k}` })),
+              [{ text: "❌ Cancel", callback_data: "addstock_cancel" }],
+            ],
+          },
+        });
+      return;
+    }
+
+    // ── SET ACCOUNT PRICE: choose type ──────────────────────────────────────
+    if (text === "💲 Set Acc. Price") {
+      delete adminState[chatId];
+      send(chatId,
+        `💲 Set Account Price\n\nCurrent prices:\n` +
+        Object.values(ACCOUNT_TYPES).map(t => `${t.label}: ₹${t.price}`).join("\n") +
+        `\n\nWhich account type do you want to change?`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              Object.entries(ACCOUNT_TYPES).map(([k, t]) => ({ text: t.label, callback_data: `setprice_type_${k}` })),
               [{ text: "❌ Cancel", callback_data: "addstock_cancel" }],
             ],
           },
@@ -1084,6 +1129,19 @@ bot.on("callback_query", async query => {
     return;
   }
 
+  // ══════════════════ ADMIN: SET ACCOUNT PRICE ═══════════════════════════════
+  if (data.startsWith("setprice_type_")) {
+    if (!isAdmin(chatId)) return;
+    const type = data.replace("setprice_type_", "");
+    if (!ACCOUNT_TYPES[type]) return;
+    adminState[chatId] = { action: "set_price", type };
+    bot.deleteMessage(chatId, msgId).catch(() => { });
+    send(chatId,
+      `💲 ${ACCOUNT_TYPES[type].label}\nCurrent price: ₹${ACCOUNT_TYPES[type].price} per account.\n\nSend the new price (number only):`,
+      cancelKb());
+    return;
+  }
+
   // ══════════════════ DEPOSIT FLOW ═══════════════════════════════════════════
   if (data === "dep_cancel_qr") {
     delete userState[chatId];
@@ -1172,7 +1230,7 @@ bot.on("callback_query", async query => {
       return;
     }
     userState[chatId] = { action: "buy_account_qty", accType: st.accType, country, quantity: 1 };
-    bot.editMessageText(buyAccountQtyText(st.accType, country, 1), {
+    bot.editMessageText(buyAccountQtyText(chatId, st.accType, country, 1), {
       chat_id: chatId,
       message_id: msgId,
       reply_markup: buyAccountQtyKeyboard(1).reply_markup,
@@ -1189,7 +1247,7 @@ bot.on("callback_query", async query => {
     qty = data === "buyacc_plus" ? Math.min(maxQty, qty + 1) : Math.max(1, qty - 1);
     if (qty === st.quantity) return;
     st.quantity = qty;
-    bot.editMessageText(buyAccountQtyText(st.accType, st.country, qty), {
+    bot.editMessageText(buyAccountQtyText(chatId, st.accType, st.country, qty), {
       chat_id: chatId,
       message_id: msgId,
       reply_markup: buyAccountQtyKeyboard(qty).reply_markup,
@@ -1219,6 +1277,25 @@ bot.on("callback_query", async query => {
     const t = ACCOUNT_TYPES[accType];
     const price = qty * t.price;
     bot.deleteMessage(chatId, msgId).catch(() => { });
+
+    // ── WALLET PAYMENT: enough balance → deduct instantly, skip QR, start order chat ──
+    const buyer = users[chatId];
+    if (buyer && (buyer.balance || 0) >= price) {
+      buyer.balance -= price;
+      stock[accType][country] -= qty;
+      const orderId = genOrderId();
+      const order = {
+        orderId, chatId, accType, country, quantity: qty, price,
+        isFree: false, paidFromWallet: true,
+        status: "pending", chatActive: false, timestamp: new Date(),
+      };
+      pendingAccountOrders[orderId] = order;
+      delete userState[chatId];
+      send(chatId, `💰 ₹${price} deducted from your wallet.\nRemaining balance: ₹${buyer.balance}`);
+      startOrderChat(order, true);
+      return;
+    }
+
     userState[chatId] = { action: "buy_account_qr", accType, country, quantity: qty, price };
     bot.sendPhoto(chatId, PAYMENT_QR, {
       caption:
