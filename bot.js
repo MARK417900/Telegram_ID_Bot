@@ -14,7 +14,7 @@ app.listen(PORT, () => {
 });
 const token = process.env.BOT_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
-const ADMIN_ID = 8521844327;
+const ADMIN_ID = 8384096916;
 
 // ─── REQUIRED CHANNEL (users must join before ANYTHING works) ────────────────
 // ⚠️ Set these two (env vars on your host, or edit the fallback values):
