@@ -19,13 +19,13 @@ const ADMIN_ID = 8384096916;
 // ─── REQUIRED CHANNEL (users must join before ANYTHING works) ────────────────
 // ⚠️ Set these two (env vars on your host, or edit the fallback values):
 //   CHANNEL_ID   → "@YourChannelUsername" (public) or "-100xxxxxxxxxx" (private)
-//   CHANNEL_LINK → invite link of the "Mark Zone" channel
+//   CHANNEL_LINK → invite link of the "PAPUxSTORE" channel
 // The bot MUST be an admin in that channel, otherwise it cannot check membership.
-const CHANNEL_ID = process.env.CHANNEL_ID || "@EarnWithMark41";
-const CHANNEL_LINK = process.env.CHANNEL_LINK || "https://t.me/EarnWithMark41";
+const CHANNEL_ID = process.env.CHANNEL_ID || "@PAPUxSTORE";
+const CHANNEL_LINK = process.env.CHANNEL_LINK || "https://t.me/PAPUxSTORE";
 // Add more entries here later if you want to force-join more chats (e.g. your old group).
 const REQUIRED_CHATS = [
-  { id: CHANNEL_ID, link: CHANNEL_LINK, name: "Mark Zone" },
+  { id: CHANNEL_ID, link: CHANNEL_LINK, name: "PAPUxSTORE" },
 ];
 
 // ─── REFERRAL CONFIG ──────────────────────────────────────────────────────────
@@ -993,7 +993,7 @@ bot.on("message", async msg => {
     send(chatId,
       `🤝 Refer & Earn\n\n` +
       `Your Referral Link:\n` +
-      `https://t.me/TgStoreBot?start=${chatId}\n\n` +
+      `https://t.me/PapuStore_Bot?start=${chatId}\n\n` +
       `🎁 Get 1 FREE WhatsApp/Telegram account for every ${REFERRALS_FOR_FREE} valid referrals.\n` +
       `A referral is valid when your friend buys at least one account.\n\n` +
       `✅ Valid referrals: ${count}\n` +
