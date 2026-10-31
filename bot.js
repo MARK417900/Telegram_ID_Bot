@@ -732,7 +732,7 @@ bot.on("message", async msg => {
       if (!order) {
         send(chatId,
           activeOrders().length
-            ? `⚠️ ${activeOrders().length} order chats are open. Swipe-reply to a message of the order, then press the button again (or tap 💬 Active Orders).`
+            ? `⚠️ ${activeOrders().length} order chats are open.`
             : `No active order chat right now.`,
           adminKb());
         return;
@@ -824,7 +824,7 @@ bot.on("message", async msg => {
       }
       if (activeOrders().length > 1) {
         send(chatId,
-          `⚠️ ${activeOrders().length} order chats are open. Swipe-reply to a message of the order you want to answer.\n` +
+          `⚠️ ${activeOrders().length} order chats are open.` +
           `Tap 💬 Active Orders to see them all.`,
           chatKeyboard());
         return;
@@ -1077,12 +1077,7 @@ bot.on("callback_query", async query => {
     bot.deleteMessage(chatId, msgId).catch(() => { });
     send(chatId,
       `📦 Add ${ACCOUNT_TYPES[type].label} Stock\n\n` +
-      `Send quantity, country and price per account. Example:\n\n` +
-      `2 india 40\n\n` +
-      `Several at once:\n` +
-      `2 india 40 3 nepal 35 4 indonesia 30\n\n` +
-      `Buyers automatically get a button (with the price) for each country in stock. ` +
-      `The price you send becomes the price for that country.\n\n` +
+      `Send quantity, country and price/account.\n\n` +
       `Current stock:\n` +
       (countriesInStock(type).map(([k, n]) => `${countryLabel(k)}: ${n} @ ₹${priceOf(type, k)}`).join("\n") || "— none —"),
       cancelKb());
